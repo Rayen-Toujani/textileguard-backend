@@ -2,8 +2,9 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
@@ -11,19 +12,14 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for caching
+# Copy requirements
 COPY requirements.txt .
 
-# Install CPU-only PyTorch (much smaller)
-RUN pip install --no-cache-dir \
-    torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu \
-    torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cpu
-
-# Install other dependencies
+# Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
+# Copy application files
 COPY . .
 
-# Use Railway's PORT variable
+# Use Railway's PORT environment variable
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
