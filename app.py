@@ -26,7 +26,7 @@ h1, h2, h3 {
 """, unsafe_allow_html=True)
 
 # ---------------- API CALL ----------------
-API_URL = "http://127.0.0.1:8000/predict"
+API_URL = "http://127.0.0.1:8000/api/predict"
 
 def call_api(image_file):
     try:
