@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from PIL import Image
 import io
 import os
@@ -11,7 +12,7 @@ app = FastAPI(title="TextileGuard AI")
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with your Vercel domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,17 +26,32 @@ def root():
 def health():
     return {"status": "healthy"}
 
-@app.post("/api/predict")  # Changed from /predict to /api/predict
+@app.post("/api/predict")
 async def predict(file: UploadFile = File(...)):
     try:
+        # Read file contents
         contents = await file.read()
+        
+        # Open as PIL Image and keep it as PIL Image
         image = Image.open(io.BytesIO(contents))
         
+        # Convert to RGB if needed (in case of RGBA or grayscale)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Pass PIL Image directly to predict function
         predictions = predict_image(image)
         
         return {"predictions": predictions}
+        
     except Exception as e:
-        return {"error": str(e)}, 500
+        import traceback
+        print(f"Error in predict endpoint: {str(e)}")
+        print(traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 if __name__ == "__main__":
     import uvicorn

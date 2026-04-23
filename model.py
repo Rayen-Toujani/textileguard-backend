@@ -1,21 +1,15 @@
 from ultralytics import YOLO
 import torch
-from PIL import Image
-import numpy as np
 
 model = YOLO("best.pt")
 
-def predict_image(image):
+def predict_image(pil_image):
+    """
+    Expects a PIL Image object
+    """
     try:
-        # Ensure image is PIL Image (not numpy array)
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-        elif not isinstance(image, Image.Image):
-            # If it's something else, try to convert
-            image = Image.open(image)
-        
-        # Run inference
-        results = model(image, verbose=False)
+        # Run inference - image should already be PIL Image
+        results = model(pil_image, verbose=False)
         result = results[0]
         
         predictions = []
@@ -60,6 +54,7 @@ def predict_image(image):
                     "bbox": bbox
                 })
         
+        print(f"Predictions: {predictions}")
         return predictions
         
     except Exception as e:
