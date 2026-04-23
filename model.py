@@ -9,18 +9,30 @@ def predict_image(image):
         results = model(image, verbose=False)
         result = results[0]
         
+        # DEBUG: Print what we got
+        print(f"Model task: {model.task}")
+        print(f"Has probs: {result.probs is not None}")
+        print(f"Has boxes: {result.boxes is not None}")
+        
+        if result.probs is not None:
+            print(f"Probs shape: {result.probs.data.shape}")
+            print(f"Top5: {result.probs.top5}")
+            print(f"All probs: {result.probs.data}")
+        
+        if result.boxes is not None:
+            print(f"Number of boxes: {len(result.boxes)}")
+        
         predictions = []
         
         # Classification model
         if result.probs is not None:
             probs = result.probs
-            top5_indices = probs.top5  # Already a list or tensor
+            top5_indices = probs.top5
             
             for idx in top5_indices:
                 idx = int(idx)
                 conf_value = probs.data[idx]
                 
-                # Handle both tensor and numpy
                 if isinstance(conf_value, torch.Tensor):
                     conf = float(conf_value.item())
                 else:
@@ -34,15 +46,12 @@ def predict_image(image):
         # Detection model
         elif result.boxes is not None and len(result.boxes) > 0:
             for box in result.boxes:
-                # Get class
                 cls_tensor = box.cls[0]
                 cls_id = int(cls_tensor.item() if isinstance(cls_tensor, torch.Tensor) else cls_tensor)
                 
-                # Get confidence
                 conf_tensor = box.conf[0]
                 conf = float(conf_tensor.item() if isinstance(conf_tensor, torch.Tensor) else conf_tensor)
                 
-                # Get bbox (center x, y, width, height)
                 bbox_tensor = box.xywh[0]
                 if isinstance(bbox_tensor, torch.Tensor):
                     bbox = bbox_tensor.cpu().tolist()
@@ -55,10 +64,10 @@ def predict_image(image):
                     "bbox": bbox
                 })
         
+        print(f"Returning {len(predictions)} predictions")
         return predictions
         
     except Exception as e:
-        # Log error for debugging
         import traceback
         print(f"Error in predict_image: {str(e)}")
         print(traceback.format_exc())
