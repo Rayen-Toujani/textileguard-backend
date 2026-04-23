@@ -1,26 +1,22 @@
 from ultralytics import YOLO
 import torch
+from PIL import Image
+import numpy as np
 
 model = YOLO("best.pt")
 
 def predict_image(image):
     try:
+        # Ensure image is PIL Image (not numpy array)
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+        elif not isinstance(image, Image.Image):
+            # If it's something else, try to convert
+            image = Image.open(image)
+        
         # Run inference
         results = model(image, verbose=False)
         result = results[0]
-        
-        # DEBUG: Print what we got
-        print(f"Model task: {model.task}")
-        print(f"Has probs: {result.probs is not None}")
-        print(f"Has boxes: {result.boxes is not None}")
-        
-        if result.probs is not None:
-            print(f"Probs shape: {result.probs.data.shape}")
-            print(f"Top5: {result.probs.top5}")
-            print(f"All probs: {result.probs.data}")
-        
-        if result.boxes is not None:
-            print(f"Number of boxes: {len(result.boxes)}")
         
         predictions = []
         
@@ -64,7 +60,6 @@ def predict_image(image):
                     "bbox": bbox
                 })
         
-        print(f"Returning {len(predictions)} predictions")
         return predictions
         
     except Exception as e:
