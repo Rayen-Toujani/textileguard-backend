@@ -30,34 +30,29 @@ def health():
 @app.post("/api/predict")
 async def predict(file: UploadFile = File(...)):
     try:
+        # Read file contents
         contents = await file.read()
+        
+        # Open as PIL Image and keep it as PIL Image
         image = Image.open(io.BytesIO(contents))
         
-        # Extract 64x64 patches
-        patches = extract_patches(image, patch_size=64)
+        # Convert to RGB if needed (in case of RGBA or grayscale)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         
-        # Predict on each patch
-        all_predictions = []
-        for i, patch in enumerate(patches):
-            patch_preds = predict_image(patch)
-            if patch_preds:
-                # Add patch index to results
-                for pred in patch_preds:
-                    pred['patch_index'] = i
-                all_predictions.extend(patch_preds)
+        # Pass PIL Image directly to predict function
+        predictions = predict_image(image)
         
-        # Aggregate results (take highest confidence prediction)
-        if all_predictions:
-            best_pred = max(all_predictions, key=lambda x: x['confidence'])
-            return {"predictions": [best_pred], "total_patches": len(patches)}
-        
-        return {"predictions": [], "total_patches": len(patches)}
+        return {"predictions": predictions}
         
     except Exception as e:
         import traceback
-        print(f"Error: {str(e)}")
+        print(f"Error in predict endpoint: {str(e)}")
         print(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 if __name__ == "__main__":
     import uvicorn
