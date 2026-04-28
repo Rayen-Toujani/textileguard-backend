@@ -6,7 +6,7 @@ import io
 import os
 
 from model import predict_image
-from preprocessing import extract_patches
+from preprocessing import preprocess_single_patch
 
 app = FastAPI(title="TextileGuard AI")
 
@@ -33,15 +33,18 @@ async def predict(file: UploadFile = File(...)):
         # Read file contents
         contents = await file.read()
         
-        # Open as PIL Image and keep it as PIL Image
+        # Open as PIL Image
         image = Image.open(io.BytesIO(contents))
         
-        # Convert to RGB if needed (in case of RGBA or grayscale)
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+        # Apply TILDA-style preprocessing:
+        # - Convert to grayscale
+        # - Resize to 64x64
+        # - Auto-contrast normalization
+        # - Convert back to RGB for YOLO
+        processed_image = preprocess_single_patch(image)
         
-        # Pass PIL Image directly to predict function
-        predictions = predict_image(image)
+        # Pass preprocessed image to model
+        predictions = predict_image(processed_image)
         
         return {"predictions": predictions}
         
