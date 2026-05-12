@@ -5,6 +5,9 @@ from PIL import Image, ImageDraw
 import io
 import os
 import base64
+from typing import List
+import pandas as pd
+from datetime import datetime
 
 from model import predict_image
 from preprocessing import preprocess_single_patch
@@ -21,38 +24,28 @@ app.add_middleware(
 )
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
-    """
-    Draw circles around detected defects on the image
-    """
-    # Create a copy to draw on
+    """Draw circles around detected defects"""
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
     
-    # Get image dimensions
     width, height = image.size
     
     for pred in predictions:
-        # Skip "good" class - only highlight defects
         if pred['class'].lower() == 'good':
             continue
         
-        # For 64x64 patch, draw circle in center
-        # If confidence is high enough to be considered a defect
         if pred['confidence'] > 0.5:
-            # Draw circle in center of image
             center_x, center_y = width // 2, height // 2
             radius = min(width, height) // 3
             
-            # Color based on defect type
             color_map = {
-                'hole': '#ef4444',          # Red
-                'oil spot': '#f59e0b',      # Orange
-                'thread error': '#3b82f6',  # Blue
-                'objects': '#8b5cf6'        # Purple
+                'hole': '#ef4444',
+                'oil spot': '#f59e0b',
+                'thread error': '#3b82f6',
+                'objects': '#8b5cf6'
             }
             color = color_map.get(pred['class'], '#ef4444')
             
-            # Draw circle
             draw.ellipse(
                 [center_x - radius, center_y - radius, 
                  center_x + radius, center_y + radius],
@@ -60,7 +53,6 @@ def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
                 width=3
             )
             
-            # Draw label
             label = f"{pred['class']}: {pred['confidence']*100:.1f}%"
             draw.text((10, 10), label, fill=color)
     
@@ -76,23 +68,15 @@ def health():
 
 @app.post("/api/predict")
 async def predict(file: UploadFile = File(...)):
+    """Single image prediction"""
     try:
-        # Read file contents
         contents = await file.read()
-        
-        # Open as PIL Image
         original_image = Image.open(io.BytesIO(contents))
         
-        # Apply TILDA-style preprocessing for prediction
         processed_image = preprocess_single_patch(original_image)
-        
-        # Get predictions
         predictions = predict_image(processed_image)
-        
-        # Draw defects on the processed image (64x64)
         annotated_image = draw_defects_on_image(processed_image, predictions)
         
-        # Convert annotated image to base64
         buffered = io.BytesIO()
         annotated_image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
@@ -104,12 +88,89 @@ async def predict(file: UploadFile = File(...)):
         
     except Exception as e:
         import traceback
-        print(f"Error in predict endpoint: {str(e)}")
+        print(f"Error: {str(e)}")
         print(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/api/batch-predict")
+async def batch_predict(files: List[UploadFile] = File(...)):
+    """Batch image prediction"""
+    try:
+        results = []
+        
+        for idx, file in enumerate(files):
+            try:
+                # Read and process image
+                contents = await file.read()
+                original_image = Image.open(io.BytesIO(contents))
+                
+                processed_image = preprocess_single_patch(original_image)
+                predictions = predict_image(processed_image)
+                annotated_image = draw_defects_on_image(processed_image, predictions)
+                
+                # Convert to base64
+                buffered = io.BytesIO()
+                annotated_image.save(buffered, format="PNG")
+                img_base64 = base64.b64encode(buffered.getvalue()).decode()
+                
+                # Get top prediction
+                top_pred = predictions[0] if predictions else {"class": "unknown", "confidence": 0}
+                
+                results.append({
+                    "filename": file.filename,
+                    "index": idx,
+                    "predictions": predictions,
+                    "annotated_image": f"data:image/png;base64,{img_base64}",
+                    "top_class": top_pred['class'],
+                    "top_confidence": top_pred['confidence']
+                })
+                
+            except Exception as e:
+                print(f"Error processing {file.filename}: {str(e)}")
+                results.append({
+                    "filename": file.filename,
+                    "index": idx,
+                    "error": str(e)
+                })
+        
+        return {"results": results, "total": len(files)}
+        
+    except Exception as e:
+        import traceback
+        print(f"Batch error: {str(e)}")
+        print(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/api/export-csv")
+async def export_csv(results: dict):
+    """Export batch results as CSV"""
+    try:
+        data = []
+        for result in results.get('results', []):
+            if 'error' not in result:
+                data.append({
+                    'Filename': result['filename'],
+                    'Top Class': result['top_class'],
+                    'Confidence': f"{result['top_confidence']*100:.2f}%",
+                    'Status': 'DEFECT' if result['top_class'] != 'good' else 'GOOD',
+                    'Timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+        
+        df = pd.DataFrame(data)
+        
+        # Convert to CSV
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        csv_buffer.seek(0)
+        
+        return StreamingResponse(
+            iter([csv_buffer.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=textile_analysis_report.csv"}
         )
+        
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
