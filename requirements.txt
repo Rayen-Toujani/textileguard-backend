@@ -5,7 +5,7 @@ pillow==12.2.0
 torch==2.1.0
 torchvision==0.16.0
 ultralytics==8.1.20
-opencv-python-headless==4.10.1.26
+opencv-python-headless==4.8.1.78
 numpy==1.26.4
 pydantic==2.6.0
 pandas==2.2.0
