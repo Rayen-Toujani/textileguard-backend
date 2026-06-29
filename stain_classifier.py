@@ -5,6 +5,7 @@ Integrates with existing FastAPI backend (main.py)
 """
 
 import io
+import threading
 import numpy as np
 from PIL import Image
 import tensorflow as tf
@@ -28,19 +29,22 @@ CONFIDENCE_LABELS = {
 
 # ── Model loader (singleton) ──────────────────────────────────────────────────
 _model = None
+_model_lock = threading.Lock()
 
 def get_stain_model():
-    """Load model once and reuse across requests."""
+    """Load model once and reuse across requests. Thread-safe against concurrent first calls."""
     global _model
     if _model is None:
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(
-                f"Stain model not found at '{MODEL_PATH}'. "
-                f"Set STAIN_MODEL_PATH env var or place stain_model.h5 in backend/."
-            )
-        logger.info(f"Loading stain classifier from {MODEL_PATH} ...")
-        _model = load_model(MODEL_PATH)
-        logger.info("Stain classifier loaded ✓")
+        with _model_lock:
+            if _model is None:
+                if not os.path.exists(MODEL_PATH):
+                    raise FileNotFoundError(
+                        f"Stain model not found at '{MODEL_PATH}'. "
+                        f"Set STAIN_MODEL_PATH env var or place stain_model.h5 in backend/."
+                    )
+                logger.info(f"Loading stain classifier from {MODEL_PATH} ...")
+                _model = load_model(MODEL_PATH)
+                logger.info("Stain classifier loaded ✓")
     return _model
 
 

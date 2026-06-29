@@ -88,13 +88,13 @@ async def predict(file: UploadFile = File(...)):
         original_image = Image.open(io.BytesIO(contents))
         
         processed_image = preprocess_single_patch(original_image)
-        predictions = predict_image(processed_image)
+        predictions = await asyncio.to_thread(predict_image, processed_image)
         annotated_image = draw_defects_on_image(processed_image, predictions)
-        
+
         buffered = io.BytesIO()
         annotated_image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
-        
+
         return {
             "predictions": predictions,
             "annotated_image": f"data:image/png;base64,{img_base64}"
@@ -119,7 +119,7 @@ async def batch_predict(files: List[UploadFile] = File(...)):
                 original_image = Image.open(io.BytesIO(contents))
                 
                 processed_image = preprocess_single_patch(original_image)
-                predictions = predict_image(processed_image)
+                predictions = await asyncio.to_thread(predict_image, processed_image)
                 annotated_image = draw_defects_on_image(processed_image, predictions)
                 
                 # Convert to base64
@@ -205,7 +205,7 @@ async def classify_stain_endpoint(file: UploadFile = File(...)):
     """
     try:
         image_bytes = await file.read()
-        result = classify_stain(image_bytes)
+        result = await asyncio.to_thread(classify_stain, image_bytes)
         result["filename"] = file.filename
         return result
     except FileNotFoundError as e:
@@ -231,7 +231,7 @@ async def classify_stain_batch_endpoint(files: List[UploadFile] = File(...)):
     """
     try:
         images = [(f.filename, await f.read()) for f in files]
-        results = classify_stain_batch(images)
+        results = await asyncio.to_thread(classify_stain_batch, images)
 
         passed   = sum(1 for r in results if r["passed"])
         failed   = len(results) - passed
