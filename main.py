@@ -72,7 +72,7 @@ def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     
     return annotated
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "TextileGuard AI is running", "version": "1.0.0"}
 
