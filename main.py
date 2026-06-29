@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, ImageDraw
+import asyncio
 import io
 import os
 import base64
@@ -27,12 +28,14 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def load_stain_model():
-    """Pre-load stain model on startup so first request isn't slow."""
-    try:
-        get_stain_model()
-        print("✓ Stain classifier loaded on startup")
-    except FileNotFoundError as e:
-        print(f"⚠ Stain model not found (Part 2 disabled): {e}")
+    """Load stain model in the background so it doesn't block port binding."""
+    def _load():
+        try:
+            get_stain_model()
+            print("✓ Stain classifier loaded on startup")
+        except FileNotFoundError as e:
+            print(f"⚠ Stain model not found (Part 2 disabled): {e}")
+    asyncio.get_event_loop().run_in_executor(None, _load)
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     """Draw circles around detected defects"""
