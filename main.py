@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, ImageDraw
@@ -11,6 +11,7 @@ from datetime import datetime
 
 from model import predict_image
 from preprocessing import preprocess_single_patch
+from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 
 app = FastAPI(title="TextileGuard AI")
 
@@ -22,6 +23,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def load_stain_model():
+    """Pre-load stain model on startup so first request isn't slow."""
+    try:
+        get_stain_model()
+        print("✓ Stain classifier loaded on startup")
+    except FileNotFoundError as e:
+        print(f"⚠ Stain model not found (Part 2 disabled): {e}")
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     """Draw circles around detected defects"""
@@ -171,6 +182,73 @@ async def export_csv(results: dict):
         
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/api/classify-stain")
+async def classify_stain_endpoint(file: UploadFile = File(...)):
+    """
+    Binary fabric stain classification.
+    Returns whether the fabric is defect-free or has a stain/defect.
+
+    Response:
+        {
+            "filename":         str,
+            "label":            "defect_free" | "defect",
+            "probability":      float,
+            "confidence":       float,
+            "confidence_label": str,
+            "threshold":        float,
+            "passed":           bool
+        }
+    """
+    try:
+        image_bytes = await file.read()
+        result = classify_stain(image_bytes)
+        result["filename"] = file.filename
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stain classification failed: {str(e)}")
+
+@app.post("/api/classify-stain-batch")
+async def classify_stain_batch_endpoint(files: List[UploadFile] = File(...)):
+    """
+    Batch stain classification — processes all images in one model call.
+
+    Response:
+        {
+            "results": [...],      # one result per image
+            "summary": {
+                "total":        int,
+                "passed":       int,
+                "failed":       int,
+                "pass_rate":    float
+            }
+        }
+    """
+    try:
+        images = [(f.filename, await f.read()) for f in files]
+        results = classify_stain_batch(images)
+
+        passed   = sum(1 for r in results if r["passed"])
+        failed   = len(results) - passed
+        pass_rate = round(passed / len(results) * 100, 1) if results else 0
+
+        return {
+            "results": results,
+            "summary": {
+                "total":     len(results),
+                "passed":    passed,
+                "failed":    failed,
+                "pass_rate": pass_rate,
+            }
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch classification failed: {str(e)}")
+
+
 
 if __name__ == "__main__":
     import uvicorn
