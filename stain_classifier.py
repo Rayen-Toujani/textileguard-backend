@@ -1,6 +1,6 @@
 """
 TextileGuard AI — Part 2
-Fabric stain binary classifier using MobileNetV2
+Fabric stain binary classifier using MobileNetV2 (TFLite runtime)
 Integrates with existing FastAPI backend (main.py)
 """
 
@@ -8,15 +8,14 @@ import io
 import threading
 import numpy as np
 from PIL import Image
-import tensorflow as tf
-from tensorflow.keras.models import load_model
+from ai_edge_litert.interpreter import Interpreter
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH      = os.environ.get("STAIN_MODEL_PATH", "stain_model.h5")
+MODEL_PATH      = os.environ.get("STAIN_MODEL_PATH", "stain_model.tflite")
 IMG_SIZE        = (224, 224)
 THRESHOLD       = 0.075   # optimal threshold from training (Kappa 0.9467)
 CLASS_NAMES     = {0: "defect_free", 1: "defect"}
@@ -28,24 +27,29 @@ CONFIDENCE_LABELS = {
 }
 
 # ── Model loader (singleton) ──────────────────────────────────────────────────
-_model = None
+_interpreter = None
 _model_lock = threading.Lock()
+# TFLite Interpreter instances aren't safe for concurrent invoke() calls, so
+# every set_tensor/invoke/get_tensor sequence below is serialized through this.
+_inference_lock = threading.Lock()
 
 def get_stain_model():
-    """Load model once and reuse across requests. Thread-safe against concurrent first calls."""
-    global _model
-    if _model is None:
+    """Load the TFLite interpreter once and reuse across requests. Thread-safe against concurrent first calls."""
+    global _interpreter
+    if _interpreter is None:
         with _model_lock:
-            if _model is None:
+            if _interpreter is None:
                 if not os.path.exists(MODEL_PATH):
                     raise FileNotFoundError(
                         f"Stain model not found at '{MODEL_PATH}'. "
-                        f"Set STAIN_MODEL_PATH env var or place stain_model.h5 in backend/."
+                        f"Set STAIN_MODEL_PATH env var or place stain_model.tflite in backend/."
                     )
                 logger.info(f"Loading stain classifier from {MODEL_PATH} ...")
-                _model = load_model(MODEL_PATH)
+                interpreter = Interpreter(model_path=MODEL_PATH)
+                interpreter.allocate_tensors()
+                _interpreter = interpreter
                 logger.info("Stain classifier loaded ✓")
-    return _model
+    return _interpreter
 
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
@@ -60,6 +64,43 @@ def preprocess_image(image_bytes: bytes) -> np.ndarray:
     img = img.resize(IMG_SIZE, Image.BILINEAR)
     arr = np.array(img, dtype=np.float32) / 255.0
     return np.expand_dims(arr, axis=0)   # (1, 224, 224, 3)
+
+
+def _run_inference(batch: np.ndarray) -> np.ndarray:
+    """Run the TFLite interpreter on a (N, 224, 224, 3) batch, returning N probabilities."""
+    interpreter = get_stain_model()
+    with _inference_lock:
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        if tuple(input_details[0]["shape"]) != batch.shape:
+            interpreter.resize_tensor_input(input_details[0]["index"], list(batch.shape))
+            interpreter.allocate_tensors()
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+        interpreter.set_tensor(input_details[0]["index"], batch)
+        interpreter.invoke()
+        return interpreter.get_tensor(output_details[0]["index"]).flatten()
+
+
+def _build_result(prob: float) -> dict:
+    label  = CLASS_NAMES[int(prob >= THRESHOLD)]
+    passed = prob < THRESHOLD
+    confidence = abs(prob - 0.5) * 2   # 0.0 = uncertain, 1.0 = certain
+
+    conf_label = "Uncertain"
+    for (lo, hi), text in CONFIDENCE_LABELS.items():
+        if lo <= prob < hi:
+            conf_label = text
+            break
+
+    return {
+        "label":           label,
+        "probability":     round(prob, 4),
+        "confidence":      round(confidence, 4),
+        "confidence_label": conf_label,
+        "threshold":       THRESHOLD,
+        "passed":          passed,
+    }
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -77,31 +118,9 @@ def classify_stain(image_bytes: bytes) -> dict:
             "passed":      bool            # True = defect_free
         }
     """
-    model = get_stain_model()
-    arr   = preprocess_image(image_bytes)
-
-    prob  = float(model.predict(arr, verbose=0)[0][0])
-    label = CLASS_NAMES[int(prob >= THRESHOLD)]
-    passed = prob < THRESHOLD
-
-    # Confidence = how far the probability is from the 0.5 midpoint
-    confidence = abs(prob - 0.5) * 2   # 0.0 = uncertain, 1.0 = certain
-
-    # Human-readable confidence label
-    conf_label = "Uncertain"
-    for (lo, hi), text in CONFIDENCE_LABELS.items():
-        if lo <= prob < hi:
-            conf_label = text
-            break
-
-    return {
-        "label":           label,
-        "probability":     round(prob, 4),
-        "confidence":      round(confidence, 4),
-        "confidence_label": conf_label,
-        "threshold":       THRESHOLD,
-        "passed":          passed,
-    }
+    arr  = preprocess_image(image_bytes)
+    prob = float(_run_inference(arr)[0])
+    return _build_result(prob)
 
 
 # ── Batch inference ───────────────────────────────────────────────────────────
@@ -119,32 +138,13 @@ def classify_stain_batch(images: list[tuple[str, bytes]]) -> list[dict]:
     if not images:
         return []
 
-    model = get_stain_model()
-
-    batch  = np.concatenate([preprocess_image(b) for _, b in images], axis=0)
-    probs  = model.predict(batch, verbose=0).flatten()
+    batch = np.concatenate([preprocess_image(b) for _, b in images], axis=0)
+    probs = _run_inference(batch)
 
     results = []
     for (filename, _), prob in zip(images, probs):
-        prob   = float(prob)
-        label  = CLASS_NAMES[int(prob >= THRESHOLD)]
-        passed = prob < THRESHOLD
-        conf   = abs(prob - 0.5) * 2
-
-        conf_label = "Uncertain"
-        for (lo, hi), text in CONFIDENCE_LABELS.items():
-            if lo <= prob < hi:
-                conf_label = text
-                break
-
-        results.append({
-            "filename":         filename,
-            "label":            label,
-            "probability":      round(prob, 4),
-            "confidence":       round(conf, 4),
-            "confidence_label": conf_label,
-            "threshold":        THRESHOLD,
-            "passed":           passed,
-        })
+        result = _build_result(float(prob))
+        result["filename"] = filename
+        results.append(result)
 
     return results
