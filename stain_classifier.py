@@ -1,6 +1,6 @@
 """
 TextileGuard AI — Part 2
-Fabric stain binary classifier using MobileNetV2 (TFLite runtime)
+Fabric stain binary classifier using MobileNetV2 (Keras H5)
 Integrates with existing FastAPI backend (main.py)
 """
 
@@ -8,48 +8,37 @@ import io
 import threading
 import numpy as np
 from PIL import Image
-from ai_edge_litert.interpreter import Interpreter
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH      = os.environ.get("STAIN_MODEL_PATH", "stain_model.tflite")
+MODEL_PATH      = os.environ.get("STAIN_MODEL_PATH", "stain_model.h5")
 IMG_SIZE        = (224, 224)
 THRESHOLD       = 0.075   # optimal threshold from training (Kappa 0.9467)
 CLASS_NAMES     = {0: "defect_free", 1: "defect"}
-CONFIDENCE_LABELS = {
-    (0.00, 0.30): "High confidence — clean fabric",
-    (0.30, 0.50): "Low confidence — likely clean",
-    (0.50, 0.70): "Low confidence — likely defect",
-    (0.70, 1.00): "High confidence — defect detected",
-}
 
 # ── Model loader (singleton) ──────────────────────────────────────────────────
-_interpreter = None
+_model = None
 _model_lock = threading.Lock()
-# TFLite Interpreter instances aren't safe for concurrent invoke() calls, so
-# every set_tensor/invoke/get_tensor sequence below is serialized through this.
-_inference_lock = threading.Lock()
 
 def get_stain_model():
-    """Load the TFLite interpreter once and reuse across requests. Thread-safe against concurrent first calls."""
-    global _interpreter
-    if _interpreter is None:
+    """Load the Keras model once and reuse across requests. Thread-safe against concurrent first calls."""
+    global _model
+    if _model is None:
         with _model_lock:
-            if _interpreter is None:
+            if _model is None:
                 if not os.path.exists(MODEL_PATH):
                     raise FileNotFoundError(
                         f"Stain model not found at '{MODEL_PATH}'. "
-                        f"Set STAIN_MODEL_PATH env var or place stain_model.tflite in backend/."
+                        f"Set STAIN_MODEL_PATH env var or place stain_model.h5 in backend/."
                     )
                 logger.info(f"Loading stain classifier from {MODEL_PATH} ...")
-                interpreter = Interpreter(model_path=MODEL_PATH)
-                interpreter.allocate_tensors()
-                _interpreter = interpreter
+                import tensorflow as tf
+                _model = tf.keras.models.load_model(MODEL_PATH)
                 logger.info("Stain classifier loaded ✓")
-    return _interpreter
+    return _model
 
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
@@ -67,31 +56,28 @@ def preprocess_image(image_bytes: bytes) -> np.ndarray:
 
 
 def _run_inference(batch: np.ndarray) -> np.ndarray:
-    """Run the TFLite interpreter on a (N, 224, 224, 3) batch, returning N probabilities."""
-    interpreter = get_stain_model()
-    with _inference_lock:
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        if tuple(input_details[0]["shape"]) != batch.shape:
-            interpreter.resize_tensor_input(input_details[0]["index"], list(batch.shape))
-            interpreter.allocate_tensors()
-            input_details = interpreter.get_input_details()
-            output_details = interpreter.get_output_details()
-        interpreter.set_tensor(input_details[0]["index"], batch)
-        interpreter.invoke()
-        return interpreter.get_tensor(output_details[0]["index"]).flatten()
+    """Run the Keras model on a (N, 224, 224, 3) batch, returning N probabilities."""
+    model = get_stain_model()
+    return model.predict(batch, verbose=0).flatten()
 
 
 def _build_result(prob: float) -> dict:
-    label  = CLASS_NAMES[int(prob >= THRESHOLD)]
-    passed = prob < THRESHOLD
-    confidence = abs(prob - 0.5) * 2   # 0.0 = uncertain, 1.0 = certain
+    is_defect = prob >= THRESHOLD
+    label  = CLASS_NAMES[int(is_defect)]
+    passed = not is_defect
 
-    conf_label = "Uncertain"
-    for (lo, hi), text in CONFIDENCE_LABELS.items():
-        if lo <= prob < hi:
-            conf_label = text
-            break
+    # Distance from the actual decision boundary (THRESHOLD), normalized to
+    # each side's range, so confidence reflects how close prob is to the
+    # boundary that actually decides the label — not a fixed 0.5 midpoint.
+    if is_defect:
+        confidence = (prob - THRESHOLD) / max(1.0 - THRESHOLD, 1e-6)
+    else:
+        confidence = (THRESHOLD - prob) / max(THRESHOLD, 1e-6)
+
+    if is_defect:
+        conf_label = "High confidence — defect detected" if confidence >= 0.5 else "Low confidence — likely defect"
+    else:
+        conf_label = "High confidence — clean fabric" if confidence >= 0.5 else "Low confidence — likely clean"
 
     return {
         "label":           label,
