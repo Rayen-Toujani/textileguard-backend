@@ -8,7 +8,6 @@ import io
 import threading
 import numpy as np
 from PIL import Image
-from ai_edge_litert.interpreter import Interpreter
 import os
 import logging
 
@@ -38,6 +37,7 @@ def get_stain_model():
                         f"Set STAIN_MODEL_PATH env var or place stain_model.tflite in backend/."
                     )
                 logger.info(f"Loading stain classifier from {MODEL_PATH} ...")
+                from ai_edge_litert.interpreter import Interpreter
                 interpreter = Interpreter(model_path=MODEL_PATH)
                 interpreter.allocate_tensors()
                 _interpreter = interpreter

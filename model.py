@@ -3,7 +3,13 @@ import torch
 import os
 import tempfile
 
-model = YOLO("best.pt")
+_model = None
+
+def _get_model():
+    global _model
+    if _model is None:
+        _model = YOLO("best.pt")
+    return _model
 
 def predict_image(pil_image):
     """
@@ -18,7 +24,7 @@ def predict_image(pil_image):
         
         try:
             # Run inference with file path instead of PIL Image
-            results = model(tmp_path, verbose=False)
+            results = _get_model()(tmp_path, verbose=False)
             result = results[0]
             
             predictions = []
@@ -27,18 +33,18 @@ def predict_image(pil_image):
             if result.probs is not None:
                 probs = result.probs
                 top5_indices = probs.top5
-                
+
                 for idx in top5_indices:
                     idx = int(idx)
                     conf_value = probs.data[idx]
-                    
+
                     if isinstance(conf_value, torch.Tensor):
                         conf = float(conf_value.item())
                     else:
                         conf = float(conf_value)
-                    
+
                     predictions.append({
-                        "class": str(model.names[idx]),
+                        "class": str(_get_model().names[idx]),
                         "confidence": conf
                     })
             
@@ -58,7 +64,7 @@ def predict_image(pil_image):
                         bbox = bbox_tensor.tolist()
                     
                     predictions.append({
-                        "class": str(model.names[cls_id]),
+                        "class": str(_get_model().names[cls_id]),
                         "confidence": conf,
                         "bbox": bbox
                     })
