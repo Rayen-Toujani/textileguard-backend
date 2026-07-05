@@ -15,6 +15,7 @@ from model import predict_image
 from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 from root_cause_classifier import RootCauseClassifier
+from report_enrichment import enrich_report_for_root_cause
 
 _root_cause_model: "RootCauseClassifier | None" = None
 
@@ -284,6 +285,73 @@ async def classify_stain_batch_endpoint(files: List[UploadFile] = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch classification failed: {str(e)}")
 
+
+
+@app.post("/api/enrich-and-predict-cause")
+async def enrich_and_predict_cause(results: dict):
+    """
+    One-shot pipeline: batch-predict report → enrich → root-cause prediction.
+
+    Accepts the same `results` payload as /api/export-csv.
+    Returns an enriched CSV (download) with predicted_cause and cause_confidence
+    appended to each DEFECT row.
+
+    ⚠️  Production-line context columns (machine_id, shift, humidity_pct, etc.)
+    are RANDOMLY GENERATED placeholders — is_simulated_context=True marks them
+    in every output row.  Wire up real MES/SCADA data before using predictions
+    for operational decisions.
+    """
+    if _root_cause_model is None:
+        raise HTTPException(status_code=503, detail="Root cause model not loaded")
+
+    data = []
+    for result in results.get("results", []):
+        if "error" not in result:
+            data.append({
+                "Filename":  result["filename"],
+                "Top Class": result["top_class"],
+                "Confidence": f"{result['top_confidence'] * 100:.2f}%",
+                "Status":    "DEFECT" if result["top_class"] != "good" else "GOOD",
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+    if not data:
+        raise HTTPException(status_code=400, detail="No results to process")
+
+    report_df = pd.DataFrame(data)
+    enriched, warnings = enrich_report_for_root_cause(report_df)
+
+    if enriched.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No DEFECT rows found — all images passed quality check",
+        )
+
+    if warnings:
+        print(f"[enrich-and-predict-cause] Unmapped classes: {warnings}")
+
+    try:
+        predictions = await asyncio.to_thread(
+            _root_cause_model.predict_batch,
+            enriched[_root_cause_model.required_columns],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Root cause prediction failed: {str(e)}")
+
+    enriched["predicted_cause"]   = [p["predicted_cause"] for p in predictions]
+    enriched["cause_confidence"]  = [round(p["confidence"], 4) for p in predictions]
+
+    csv_buffer = io.StringIO()
+    enriched.to_csv(csv_buffer, index=False)
+    csv_buffer.seek(0)
+
+    return StreamingResponse(
+        iter([csv_buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=root_cause_report.csv"},
+    )
 
 
 @app.post("/api/predict-cause")
