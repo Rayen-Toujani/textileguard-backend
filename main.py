@@ -191,32 +191,59 @@ async def batch_predict(files: List[UploadFile] = File(...)):
 
 @app.post("/api/export-csv")
 async def export_csv(results: dict):
-    """Export batch results as CSV"""
+    """
+    Export batch results as an enriched root-cause CSV for DEFECT rows.
+    GOOD rows are excluded — the root-cause model only applies to defects.
+    Falls back to the basic 5-column format if all images passed (no defects).
+    """
     try:
         data = []
         for result in results.get('results', []):
             if 'error' not in result:
                 data.append({
-                    'Filename': result['filename'],
+                    'Filename':  result['filename'],
                     'Top Class': result['top_class'],
                     'Confidence': f"{result['top_confidence']*100:.2f}%",
-                    'Status': 'DEFECT' if result['top_class'] != 'good' else 'GOOD',
-                    'Timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    'Status':    'DEFECT' if result['top_class'] != 'good' else 'GOOD',
+                    'Timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 })
-        
+
         df = pd.DataFrame(data)
-        
-        # Convert to CSV
+
+        enriched, warnings = enrich_report_for_root_cause(df)
+
+        if warnings:
+            print(f"[export-csv] Unmapped classes: {warnings}")
+
+        if not enriched.empty:
+            # Add root-cause predictions if model is loaded (soft dependency)
+            if _root_cause_model is not None:
+                try:
+                    preds = await asyncio.to_thread(
+                        _root_cause_model.predict_batch,
+                        enriched[_root_cause_model.required_columns],
+                    )
+                    enriched["predicted_cause"]  = [p["predicted_cause"] for p in preds]
+                    enriched["cause_confidence"] = [round(p["confidence"], 4) for p in preds]
+                except Exception as e:
+                    print(f"[export-csv] Root cause prediction skipped: {e}")
+            out_df   = enriched
+            filename = "root_cause_report.csv"
+        else:
+            # No DEFECT rows — return the plain report so the download still works
+            out_df   = df
+            filename = "textile_analysis_report.csv"
+
         csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False)
+        out_df.to_csv(csv_buffer, index=False)
         csv_buffer.seek(0)
-        
+
         return StreamingResponse(
             iter([csv_buffer.getvalue()]),
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=textile_analysis_report.csv"}
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
-        
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
