@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from PIL import Image, ImageDraw
 import asyncio
 import io
@@ -13,6 +14,24 @@ from datetime import datetime
 from model import predict_image
 from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
+from root_cause_classifier import RootCauseClassifier
+
+_root_cause_model: "RootCauseClassifier | None" = None
+
+
+class DefectRecord(BaseModel):
+    defect_type: str
+    defect_size_mm: float
+    machine_id: str
+    machine_age_years: float
+    days_since_maintenance: int
+    shift: str
+    operator_experience_years: float
+    production_speed_mpm: float
+    thread_tension_n: float
+    humidity_pct: float
+    temperature_c: float
+    fabric_batch_quality_score: float
 
 app = FastAPI(title="TextileGuard AI")
 
@@ -27,15 +46,29 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-async def load_stain_model():
-    """Load stain model in the background so it doesn't block port binding."""
-    def _load():
+async def load_models():
+    """Load all ML models in background threads so startup doesn't block port binding."""
+    def _load_stain():
         try:
             get_stain_model()
             print("✓ Stain classifier loaded on startup")
         except FileNotFoundError as e:
-            print(f"⚠ Stain model not found (Part 2 disabled): {e}")
-    asyncio.get_event_loop().run_in_executor(None, _load)
+            print(f"⚠ Stain model not found (Model 2 disabled): {e}")
+
+    def _load_root_cause():
+        global _root_cause_model
+        try:
+            path = os.environ.get("ROOT_CAUSE_MODEL_PATH", "root_cause_model.joblib")
+            _root_cause_model = RootCauseClassifier(path)
+            print("✓ Root cause classifier loaded on startup")
+        except FileNotFoundError as e:
+            print(f"⚠ Root cause model not found (Model 3 disabled): {e}")
+        except Exception as e:
+            print(f"⚠ Root cause model load failed: {e}")
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _load_stain)
+    loop.run_in_executor(None, _load_root_cause)
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     """Draw circles around detected defects"""
@@ -251,6 +284,53 @@ async def classify_stain_batch_endpoint(files: List[UploadFile] = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch classification failed: {str(e)}")
 
+
+
+@app.post("/api/predict-cause")
+async def predict_cause(record: DefectRecord):
+    """Predict the root cause of a single defect record (JSON body)."""
+    if _root_cause_model is None:
+        raise HTTPException(status_code=503, detail="Root cause model not loaded")
+    try:
+        result = await asyncio.to_thread(_root_cause_model.predict, record.model_dump())
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Root cause prediction failed: {str(e)}")
+
+
+@app.post("/api/predict-cause-batch")
+async def predict_cause_batch(file: UploadFile = File(...)):
+    """
+    Predict root causes for every row in an uploaded CSV.
+    Required columns: defect_type, defect_size_mm, machine_id, machine_age_years,
+    days_since_maintenance, shift, operator_experience_years, production_speed_mpm,
+    thread_tension_n, humidity_pct, temperature_c, fabric_batch_quality_score
+    """
+    if _root_cause_model is None:
+        raise HTTPException(status_code=503, detail="Root cause model not loaded")
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File must be a .csv")
+
+    contents = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not parse CSV file")
+
+    try:
+        results = await asyncio.to_thread(_root_cause_model.predict_batch, df)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch root cause prediction failed: {str(e)}")
+
+    counts = pd.Series([r["predicted_cause"] for r in results]).value_counts().to_dict()
+    return {
+        "results": results,
+        "summary": {"total": len(results), "cause_counts": counts},
+    }
 
 
 if __name__ == "__main__":
