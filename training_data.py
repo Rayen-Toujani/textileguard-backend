@@ -27,19 +27,22 @@ def save_upload_and_prediction(
     model_used: str,
     result_json: dict,
     confidence: Optional[float],
-) -> None:
+    raise_on_error: bool = False,
+) -> Optional[dict]:
     """
     Anonymous callers (user_id is None) are a no-op — nothing to save.
 
     Otherwise: if file_bytes is given, upload it to the "uploads" bucket at
     {user_id}/{uuid}.{ext} and insert an `uploads` row; then always insert a
-    `predictions` row (upload_id is None when there was no file).
+    `predictions` row (upload_id is None when there was no file). Returns
+    {"upload_id": ..., "prediction_id": ...} on success.
 
-    Never raises — errors are logged and swallowed so a training-data write
-    failure can't break the actual prediction response.
+    By default, never raises — errors are logged and swallowed so a
+    training-data write failure can't break the actual prediction response.
+    Pass raise_on_error=True (debug-only) to propagate the exception instead.
     """
     if user_id is None:
-        return
+        return None
 
     try:
         client = get_supabase()
@@ -75,17 +78,29 @@ def save_upload_and_prediction(
             )
             upload_id = upload_row.data[0]["id"]
 
-        client.table("predictions").insert(
-            {
-                "upload_id": upload_id,
-                "user_id": user_id,
-                "model_used": model_used,
-                "result_json": result_json,
-                "confidence": confidence,
-            }
-        ).execute()
+        prediction_row = (
+            client.table("predictions")
+            .insert(
+                {
+                    "upload_id": upload_id,
+                    "user_id": user_id,
+                    "model_used": model_used,
+                    "result_json": result_json,
+                    "confidence": confidence,
+                }
+            )
+            .execute()
+        )
+
+        return {
+            "upload_id": upload_id,
+            "prediction_id": prediction_row.data[0]["id"] if prediction_row.data else None,
+        }
 
     except Exception:
         logger.exception(
             "Failed to save training data (model_used=%s, user_id=%s)", model_used, user_id
         )
+        if raise_on_error:
+            raise
+        return None

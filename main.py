@@ -116,6 +116,33 @@ def root():
 def health():
     return {"status": "healthy"}
 
+
+# TODO(debug): TEMPORARY — remove before final submission. Surfaces the real
+# exception from save_upload_and_prediction() instead of only logging it,
+# since Render's log dashboard isn't showing anything right now.
+@app.post("/api/debug-save-test")
+async def debug_save_test(current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
+    if current_user is None:
+        return {"error": "No authenticated user — Authorization header missing or invalid"}
+
+    try:
+        result = save_upload_and_prediction(
+            user_id=current_user.id,
+            file_bytes=b"test-image-bytes-not-real",
+            original_filename="debug_test.jpg",
+            file_type="image",
+            model_context="defect_detection",
+            model_used="yolo",
+            result_json={"debug": True, "test": "manual trigger"},
+            confidence=0.99,
+            raise_on_error=True,
+        )
+        return {"success": True, "result": result}
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.post("/api/predict")
 async def predict(
     file: UploadFile = File(...),
