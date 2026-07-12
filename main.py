@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -16,7 +16,7 @@ from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 from root_cause_classifier import RootCauseClassifier
 from report_enrichment import enrich_report_for_root_cause
-from auth import get_current_user_optional, CurrentUser
+from auth import get_current_user_optional, verify_supabase_token, CurrentUser
 from training_data import save_upload_and_prediction
 
 _root_cause_model: "RootCauseClassifier | None" = None
@@ -117,14 +117,29 @@ def health():
     return {"status": "healthy"}
 
 
-# TODO(debug): TEMPORARY — remove before final submission. Surfaces the real
-# exception from save_upload_and_prediction() instead of only logging it,
-# since Render's log dashboard isn't showing anything right now.
+# TODO(debug): TEMPORARY — remove before final submission. Bypasses
+# get_current_user_optional (which swallows verification exceptions) and
+# calls verify_supabase_token directly so a failure is visible in the
+# response instead of just looking like "no user".
 @app.post("/api/debug-save-test")
-async def debug_save_test(current_user: Optional[CurrentUser] = Depends(get_current_user_optional)):
-    if current_user is None:
-        return {"error": "No authenticated user — Authorization header missing or invalid"}
+async def debug_save_test(request: Request):
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return {"error": "No Authorization header found", "header_received": auth_header}
 
+    try:
+        current_user = verify_supabase_token(auth_header)
+    except Exception as e:
+        import traceback
+        return {
+            "error": "Token verification failed",
+            "exception": str(e),
+            "exception_type": type(e).__name__,
+            "exception_detail": getattr(e, "detail", None),
+            "traceback": traceback.format_exc(),
+        }
+
+    # If we got here, verification succeeded — proceed with the save test
     try:
         result = save_upload_and_prediction(
             user_id=current_user.id,
@@ -133,7 +148,7 @@ async def debug_save_test(current_user: Optional[CurrentUser] = Depends(get_curr
             file_type="image",
             model_context="defect_detection",
             model_used="yolo",
-            result_json={"debug": True, "test": "manual trigger"},
+            result_json={"debug": True},
             confidence=0.99,
             raise_on_error=True,
         )
