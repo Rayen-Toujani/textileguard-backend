@@ -2,14 +2,26 @@ import os
 from typing import Optional
 
 import jwt
+from jwt import PyJWKClient
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
+# Unused by verify_supabase_token (Supabase signs access tokens with ES256,
+# verified below via JWKS, not a shared HS256 secret) — kept in case
+# anything else in the codebase still reads it.
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+# Cached once at module load rather than per-request; PyJWKClient handles its
+# own key caching/refresh internally.
+_jwks_client: Optional[PyJWKClient] = (
+    PyJWKClient(f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json")
+    if SUPABASE_URL
+    else None
+)
 
 
 class CurrentUser(BaseModel):
@@ -22,11 +34,14 @@ def verify_supabase_token(authorization_header: Optional[str]) -> CurrentUser:
     Validate a Supabase-issued access token (the frontend session's JWT) and
     return the authenticated user.
 
+    Supabase signs access tokens with ES256 (asymmetric) — verified here
+    against the project's public JWKS keys, not a shared secret.
+
     `authorization_header` is the raw `Authorization` header value, e.g. "Bearer <jwt>".
     Raises HTTPException(401) if the header is missing/malformed or the token
     is invalid, expired, or was not issued by this Supabase project.
     """
-    if not SUPABASE_URL or not SUPABASE_JWT_SECRET:
+    if not SUPABASE_URL or _jwks_client is None:
         raise HTTPException(status_code=500, detail="Supabase auth is not configured on the server")
 
     if not authorization_header or not authorization_header.startswith("Bearer "):
@@ -35,10 +50,11 @@ def verify_supabase_token(authorization_header: Optional[str]) -> CurrentUser:
     token = authorization_header.split(" ", 1)[1].strip()
 
     try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
         payload = jwt.decode(
             token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
+            signing_key.key,
+            algorithms=["ES256"],
             audience="authenticated",
             issuer=f"{SUPABASE_URL.rstrip('/')}/auth/v1",
         )
