@@ -17,7 +17,7 @@ from stain_classifier import classify_stain, classify_stain_batch, get_stain_mod
 from root_cause_classifier import RootCauseClassifier
 from report_enrichment import enrich_report_for_root_cause
 from auth import get_current_user_optional, verify_supabase_token, CurrentUser
-from training_data import save_upload_and_prediction
+from training_data import save_upload_and_prediction, save_upload, save_prediction
 
 _root_cause_model: "RootCauseClassifier | None" = None
 
@@ -108,6 +108,22 @@ def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     
     return annotated
 
+def _run_yolo(image_bytes: bytes) -> dict:
+    """Run YOLO defect detection on raw image bytes. Blocking — call via asyncio.to_thread."""
+    original_image = Image.open(io.BytesIO(image_bytes))
+    processed_image = preprocess_single_patch(original_image)
+    predictions = predict_image(processed_image)
+    annotated_image = draw_defects_on_image(processed_image, predictions)
+
+    buffered = io.BytesIO()
+    annotated_image.save(buffered, format="PNG")
+    img_base64 = base64.b64encode(buffered.getvalue()).decode()
+
+    return {
+        "predictions": predictions,
+        "annotated_image": f"data:image/png;base64,{img_base64}",
+    }
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "TextileGuard AI is running", "version": "1.0.0"}
@@ -166,17 +182,9 @@ async def predict(
     """Single image prediction"""
     try:
         contents = await file.read()
-        original_image = Image.open(io.BytesIO(contents))
+        yolo_result = await asyncio.to_thread(_run_yolo, contents)
 
-        processed_image = preprocess_single_patch(original_image)
-        predictions = await asyncio.to_thread(predict_image, processed_image)
-        annotated_image = draw_defects_on_image(processed_image, predictions)
-
-        buffered = io.BytesIO()
-        annotated_image.save(buffered, format="PNG")
-        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-
-        top_pred = predictions[0] if predictions else None
+        top_pred = yolo_result["predictions"][0] if yolo_result["predictions"] else None
         save_upload_and_prediction(
             user_id=current_user.id if current_user else None,
             file_bytes=contents,
@@ -184,14 +192,11 @@ async def predict(
             file_type="image",
             model_context="defect_detection",
             model_used="yolo",
-            result_json={"predictions": predictions},
+            result_json={"predictions": yolo_result["predictions"]},
             confidence=top_pred["confidence"] if top_pred else None,
         )
 
-        return {
-            "predictions": predictions,
-            "annotated_image": f"data:image/png;base64,{img_base64}"
-        }
+        return yolo_result
 
     except Exception as e:
         import traceback
@@ -210,18 +215,9 @@ async def batch_predict(
 
         for idx, file in enumerate(files):
             try:
-                # Read and process image
                 contents = await file.read()
-                original_image = Image.open(io.BytesIO(contents))
-
-                processed_image = preprocess_single_patch(original_image)
-                predictions = await asyncio.to_thread(predict_image, processed_image)
-                annotated_image = draw_defects_on_image(processed_image, predictions)
-
-                # Convert to base64
-                buffered = io.BytesIO()
-                annotated_image.save(buffered, format="PNG")
-                img_base64 = base64.b64encode(buffered.getvalue()).decode()
+                yolo_result = await asyncio.to_thread(_run_yolo, contents)
+                predictions = yolo_result["predictions"]
 
                 # Get top prediction
                 top_pred = predictions[0] if predictions else {"class": "unknown", "confidence": 0}
@@ -241,11 +237,11 @@ async def batch_predict(
                     "filename": file.filename,
                     "index": idx,
                     "predictions": predictions,
-                    "annotated_image": f"data:image/png;base64,{img_base64}",
+                    "annotated_image": yolo_result["annotated_image"],
                     "top_class": top_pred['class'],
                     "top_confidence": top_pred['confidence']
                 })
-                
+
             except Exception as e:
                 print(f"Error processing {file.filename}: {str(e)}")
                 results.append({
@@ -415,6 +411,143 @@ async def classify_stain_batch_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch classification failed: {str(e)}")
 
+
+@app.post("/api/analyze")
+async def analyze(
+    file: UploadFile = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
+    """
+    Combined defect-detection + stain-classification on one image.
+
+    Runs both models on the same in-memory bytes and saves exactly one
+    `uploads` row, with both the yolo and stain `predictions` rows
+    referencing it — unlike calling /api/predict and /api/classify-stain
+    separately, which would upload and save the same file twice.
+
+    Response: {"predictions": [...], "annotated_image": "...", "stain": {...} | null}
+    stain is null if the stain model isn't loaded/failed — defect detection
+    is still returned (matches the old dual-request graceful-degradation
+    behavior where a stain failure didn't block predictions).
+    """
+    try:
+        contents = await file.read()
+        yolo_result = await asyncio.to_thread(_run_yolo, contents)
+    except Exception as e:
+        import traceback
+        print(f"Error: {str(e)}")
+        print(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    stain_result = None
+    try:
+        stain_result = await asyncio.to_thread(classify_stain, contents)
+        stain_result["filename"] = file.filename
+    except Exception as e:
+        print(f"Stain classification skipped: {e}")
+
+    user_id = current_user.id if current_user else None
+    upload_id = save_upload(
+        user_id=user_id,
+        file_bytes=contents,
+        original_filename=file.filename,
+        file_type="image",
+        model_context="defect_detection",
+    )
+
+    top_pred = yolo_result["predictions"][0] if yolo_result["predictions"] else None
+    save_prediction(
+        user_id=user_id,
+        upload_id=upload_id,
+        model_used="yolo",
+        result_json={"predictions": yolo_result["predictions"]},
+        confidence=top_pred["confidence"] if top_pred else None,
+    )
+
+    if stain_result is not None:
+        save_prediction(
+            user_id=user_id,
+            upload_id=upload_id,
+            model_used="stain",
+            result_json=stain_result,
+            confidence=stain_result["confidence"],
+        )
+
+    return {**yolo_result, "stain": stain_result}
+
+
+@app.post("/api/analyze-batch")
+async def analyze_batch(
+    files: List[UploadFile] = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
+    """
+    Combined defect-detection + stain-classification on a batch of images —
+    one upload per image (see /api/analyze) instead of two.
+
+    Response: {"results": [...], "total": N}, each result shaped like
+    /api/batch-predict's with an added "stain" field (null if that model
+    failed for this item).
+    """
+    user_id = current_user.id if current_user else None
+    results = []
+
+    for idx, file in enumerate(files):
+        try:
+            contents = await file.read()
+            yolo_result = await asyncio.to_thread(_run_yolo, contents)
+            predictions = yolo_result["predictions"]
+            top_pred = predictions[0] if predictions else {"class": "unknown", "confidence": 0}
+
+            stain_result = None
+            try:
+                stain_result = await asyncio.to_thread(classify_stain, contents)
+                stain_result["filename"] = file.filename
+            except Exception as e:
+                print(f"Stain classification skipped for {file.filename}: {e}")
+
+            upload_id = save_upload(
+                user_id=user_id,
+                file_bytes=contents,
+                original_filename=file.filename,
+                file_type="image",
+                model_context="defect_detection",
+            )
+            save_prediction(
+                user_id=user_id,
+                upload_id=upload_id,
+                model_used="yolo",
+                result_json={"predictions": predictions},
+                confidence=top_pred["confidence"],
+            )
+            if stain_result is not None:
+                save_prediction(
+                    user_id=user_id,
+                    upload_id=upload_id,
+                    model_used="stain",
+                    result_json=stain_result,
+                    confidence=stain_result["confidence"],
+                )
+
+            results.append({
+                "filename": file.filename,
+                "index": idx,
+                "predictions": predictions,
+                "annotated_image": yolo_result["annotated_image"],
+                "top_class": top_pred["class"],
+                "top_confidence": top_pred["confidence"],
+                "stain": stain_result,
+            })
+
+        except Exception as e:
+            print(f"Error processing {file.filename}: {str(e)}")
+            results.append({
+                "filename": file.filename,
+                "index": idx,
+                "error": str(e),
+            })
+
+    return {"results": results, "total": len(files)}
 
 
 @app.post("/api/enrich-and-predict-cause")

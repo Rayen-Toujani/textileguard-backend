@@ -18,66 +18,85 @@ logger = logging.getLogger(__name__)
 UPLOADS_BUCKET = "uploads"
 
 
-def save_upload_and_prediction(
+def save_upload(
     user_id: Optional[str],
-    file_bytes: Optional[bytes],
+    file_bytes: bytes,
     original_filename: Optional[str],
     file_type: Optional[str],
     model_context: Optional[str],
-    model_used: str,
-    result_json: dict,
-    confidence: Optional[float],
     raise_on_error: bool = False,
-) -> Optional[dict]:
+) -> Optional[str]:
     """
-    Anonymous callers (user_id is None) are a no-op — nothing to save.
+    Upload file_bytes to the "uploads" bucket at {user_id}/{uuid}.{ext} and
+    insert an `uploads` row. Returns the new upload_id, or None if user_id
+    is None (anonymous — no-op) or the write failed.
 
-    Otherwise: if file_bytes is given, upload it to the "uploads" bucket at
-    {user_id}/{uuid}.{ext} and insert an `uploads` row; then always insert a
-    `predictions` row (upload_id is None when there was no file). Returns
-    {"upload_id": ..., "prediction_id": ...} on success.
-
-    By default, never raises — errors are logged and swallowed so a
-    training-data write failure can't break the actual prediction response.
-    Pass raise_on_error=True (debug-only) to propagate the exception instead.
+    By default, never raises — errors are logged and swallowed. Pass
+    raise_on_error=True (debug-only) to propagate the exception instead.
     """
     if user_id is None:
         return None
 
     try:
         client = get_supabase()
-        upload_id = None
 
-        if file_bytes is not None:
-            extension = ""
-            if original_filename and "." in original_filename:
-                extension = original_filename.rsplit(".", 1)[1].lower()
-            storage_path = (
-                f"{user_id}/{uuid4()}.{extension}" if extension else f"{user_id}/{uuid4()}"
+        extension = ""
+        if original_filename and "." in original_filename:
+            extension = original_filename.rsplit(".", 1)[1].lower()
+        storage_path = (
+            f"{user_id}/{uuid4()}.{extension}" if extension else f"{user_id}/{uuid4()}"
+        )
+        content_type = mimetypes.guess_type(original_filename or "")[0] or "application/octet-stream"
+
+        client.storage.from_(UPLOADS_BUCKET).upload(
+            storage_path,
+            file_bytes,
+            {"content-type": content_type},
+        )
+
+        upload_row = (
+            client.table("uploads")
+            .insert(
+                {
+                    "user_id": user_id,
+                    "storage_path": storage_path,
+                    "file_type": file_type,
+                    "original_filename": original_filename,
+                    "model_context": model_context,
+                }
             )
-            content_type = mimetypes.guess_type(original_filename or "")[0] or "application/octet-stream"
+            .execute()
+        )
+        return upload_row.data[0]["id"]
 
-            client.storage.from_(UPLOADS_BUCKET).upload(
-                storage_path,
-                file_bytes,
-                {"content-type": content_type},
-            )
+    except Exception:
+        logger.exception("Failed to save upload (user_id=%s)", user_id)
+        if raise_on_error:
+            raise
+        return None
 
-            upload_row = (
-                client.table("uploads")
-                .insert(
-                    {
-                        "user_id": user_id,
-                        "storage_path": storage_path,
-                        "file_type": file_type,
-                        "original_filename": original_filename,
-                        "model_context": model_context,
-                    }
-                )
-                .execute()
-            )
-            upload_id = upload_row.data[0]["id"]
 
+def save_prediction(
+    user_id: Optional[str],
+    upload_id: Optional[str],
+    model_used: str,
+    result_json: dict,
+    confidence: Optional[float],
+    raise_on_error: bool = False,
+) -> Optional[str]:
+    """
+    Insert a `predictions` row (upload_id may be None — e.g. root-cause
+    predictions have no source file). Returns the new prediction_id, or
+    None if user_id is None (anonymous — no-op) or the write failed.
+
+    By default, never raises — errors are logged and swallowed. Pass
+    raise_on_error=True (debug-only) to propagate the exception instead.
+    """
+    if user_id is None:
+        return None
+
+    try:
+        client = get_supabase()
         prediction_row = (
             client.table("predictions")
             .insert(
@@ -91,16 +110,52 @@ def save_upload_and_prediction(
             )
             .execute()
         )
-
-        return {
-            "upload_id": upload_id,
-            "prediction_id": prediction_row.data[0]["id"] if prediction_row.data else None,
-        }
+        return prediction_row.data[0]["id"] if prediction_row.data else None
 
     except Exception:
         logger.exception(
-            "Failed to save training data (model_used=%s, user_id=%s)", model_used, user_id
+            "Failed to save prediction (model_used=%s, user_id=%s)", model_used, user_id
         )
         if raise_on_error:
             raise
         return None
+
+
+def save_upload_and_prediction(
+    user_id: Optional[str],
+    file_bytes: Optional[bytes],
+    original_filename: Optional[str],
+    file_type: Optional[str],
+    model_context: Optional[str],
+    model_used: str,
+    result_json: dict,
+    confidence: Optional[float],
+    raise_on_error: bool = False,
+) -> Optional[dict]:
+    """
+    Convenience wrapper for the common case: one file (or none), one
+    prediction. Uploads file_bytes (if given) via save_upload, then inserts
+    one predictions row via save_prediction referencing it. Returns
+    {"upload_id": ..., "prediction_id": ...} on success, None if user_id is
+    None or either step failed to produce an id (partial writes from a
+    mid-way failure are left in place rather than rolled back).
+
+    For a batch/multi-model flow where the SAME file is used for more than
+    one prediction, call save_upload once and save_prediction per model
+    instead of this — using save_upload_and_prediction per model would
+    upload and insert the same file multiple times.
+    """
+    if user_id is None:
+        return None
+
+    upload_id = None
+    if file_bytes is not None:
+        upload_id = save_upload(
+            user_id, file_bytes, original_filename, file_type, model_context, raise_on_error
+        )
+
+    prediction_id = save_prediction(
+        user_id, upload_id, model_used, result_json, confidence, raise_on_error
+    )
+
+    return {"upload_id": upload_id, "prediction_id": prediction_id}
