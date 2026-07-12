@@ -61,3 +61,22 @@ async def get_current_user(
     if credentials is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return verify_supabase_token(f"Bearer {credentials.credentials}")
+
+
+async def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+) -> Optional[CurrentUser]:
+    """
+    FastAPI dependency for PUBLIC endpoints that want to know the caller's
+    identity *if* they happen to be logged in, without requiring auth.
+
+    Returns the authenticated user when a valid Bearer token is present,
+    otherwise returns None (missing header, malformed header, or an
+    invalid/expired token) — never raises, so the endpoint stays public.
+    """
+    if credentials is None:
+        return None
+    try:
+        return verify_supabase_token(f"Bearer {credentials.credentials}")
+    except HTTPException:
+        return None

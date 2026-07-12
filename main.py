@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ import asyncio
 import io
 import os
 import base64
-from typing import List
+from typing import List, Optional
 import pandas as pd
 from datetime import datetime
 
@@ -16,6 +16,8 @@ from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 from root_cause_classifier import RootCauseClassifier
 from report_enrichment import enrich_report_for_root_cause
+from auth import get_current_user_optional, CurrentUser
+from training_data import save_upload_and_prediction
 
 _root_cause_model: "RootCauseClassifier | None" = None
 
@@ -115,12 +117,15 @@ def health():
     return {"status": "healthy"}
 
 @app.post("/api/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
     """Single image prediction"""
     try:
         contents = await file.read()
         original_image = Image.open(io.BytesIO(contents))
-        
+
         processed_image = preprocess_single_patch(original_image)
         predictions = await asyncio.to_thread(predict_image, processed_image)
         annotated_image = draw_defects_on_image(processed_image, predictions)
@@ -129,11 +134,23 @@ async def predict(file: UploadFile = File(...)):
         annotated_image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
 
+        top_pred = predictions[0] if predictions else None
+        save_upload_and_prediction(
+            user_id=current_user.id if current_user else None,
+            file_bytes=contents,
+            original_filename=file.filename,
+            file_type="image",
+            model_context="defect_detection",
+            model_used="yolo",
+            result_json={"predictions": predictions},
+            confidence=top_pred["confidence"] if top_pred else None,
+        )
+
         return {
             "predictions": predictions,
             "annotated_image": f"data:image/png;base64,{img_base64}"
         }
-        
+
     except Exception as e:
         import traceback
         print(f"Error: {str(e)}")
@@ -141,29 +158,43 @@ async def predict(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/api/batch-predict")
-async def batch_predict(files: List[UploadFile] = File(...)):
+async def batch_predict(
+    files: List[UploadFile] = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
     """Batch image prediction"""
     try:
         results = []
-        
+
         for idx, file in enumerate(files):
             try:
                 # Read and process image
                 contents = await file.read()
                 original_image = Image.open(io.BytesIO(contents))
-                
+
                 processed_image = preprocess_single_patch(original_image)
                 predictions = await asyncio.to_thread(predict_image, processed_image)
                 annotated_image = draw_defects_on_image(processed_image, predictions)
-                
+
                 # Convert to base64
                 buffered = io.BytesIO()
                 annotated_image.save(buffered, format="PNG")
                 img_base64 = base64.b64encode(buffered.getvalue()).decode()
-                
+
                 # Get top prediction
                 top_pred = predictions[0] if predictions else {"class": "unknown", "confidence": 0}
-                
+
+                save_upload_and_prediction(
+                    user_id=current_user.id if current_user else None,
+                    file_bytes=contents,
+                    original_filename=file.filename,
+                    file_type="image",
+                    model_context="defect_detection",
+                    model_used="yolo",
+                    result_json={"predictions": predictions},
+                    confidence=top_pred["confidence"],
+                )
+
                 results.append({
                     "filename": file.filename,
                     "index": idx,
@@ -248,7 +279,10 @@ async def export_csv(results: dict):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/api/classify-stain")
-async def classify_stain_endpoint(file: UploadFile = File(...)):
+async def classify_stain_endpoint(
+    file: UploadFile = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
     """
     Binary fabric stain classification.
     Returns whether the fabric is defect-free or has a stain/defect.
@@ -268,6 +302,18 @@ async def classify_stain_endpoint(file: UploadFile = File(...)):
         image_bytes = await file.read()
         result = await asyncio.to_thread(classify_stain, image_bytes)
         result["filename"] = file.filename
+
+        save_upload_and_prediction(
+            user_id=current_user.id if current_user else None,
+            file_bytes=image_bytes,
+            original_filename=file.filename,
+            file_type="image",
+            model_context="stain_classifier",
+            model_used="stain",
+            result_json=result,
+            confidence=result["confidence"],
+        )
+
         return result
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -275,7 +321,10 @@ async def classify_stain_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Stain classification failed: {str(e)}")
 
 @app.post("/api/classify-stain-batch")
-async def classify_stain_batch_endpoint(files: List[UploadFile] = File(...)):
+async def classify_stain_batch_endpoint(
+    files: List[UploadFile] = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
     """
     Batch stain classification — processes all images in one model call.
 
@@ -293,6 +342,18 @@ async def classify_stain_batch_endpoint(files: List[UploadFile] = File(...)):
     try:
         images = [(f.filename, await f.read()) for f in files]
         results = await asyncio.to_thread(classify_stain_batch, images)
+
+        for (filename, image_bytes), result in zip(images, results):
+            save_upload_and_prediction(
+                user_id=current_user.id if current_user else None,
+                file_bytes=image_bytes,
+                original_filename=filename,
+                file_type="image",
+                model_context="stain_classifier",
+                model_used="stain",
+                result_json=result,
+                confidence=result["confidence"],
+            )
 
         passed   = sum(1 for r in results if r["passed"])
         failed   = len(results) - passed
@@ -382,12 +443,27 @@ async def enrich_and_predict_cause(results: dict):
 
 
 @app.post("/api/predict-cause")
-async def predict_cause(record: DefectRecord):
+async def predict_cause(
+    record: DefectRecord,
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
     """Predict the root cause of a single defect record (JSON body)."""
     if _root_cause_model is None:
         raise HTTPException(status_code=503, detail="Root cause model not loaded")
     try:
         result = await asyncio.to_thread(_root_cause_model.predict, record.model_dump())
+
+        save_upload_and_prediction(
+            user_id=current_user.id if current_user else None,
+            file_bytes=None,
+            original_filename=None,
+            file_type=None,
+            model_context=None,
+            model_used="root_cause",
+            result_json=result,
+            confidence=result.get("confidence"),
+        )
+
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -396,7 +472,10 @@ async def predict_cause(record: DefectRecord):
 
 
 @app.post("/api/predict-cause-batch")
-async def predict_cause_batch(file: UploadFile = File(...)):
+async def predict_cause_batch(
+    file: UploadFile = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
     """
     Predict root causes for every row in an uploaded CSV.
     Required columns: defect_type, defect_size_mm, machine_id, machine_age_years,
@@ -420,6 +499,18 @@ async def predict_cause_batch(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch root cause prediction failed: {str(e)}")
+
+    for result in results:
+        save_upload_and_prediction(
+            user_id=current_user.id if current_user else None,
+            file_bytes=None,
+            original_filename=None,
+            file_type=None,
+            model_context=None,
+            model_used="root_cause",
+            result_json=result,
+            confidence=result.get("confidence"),
+        )
 
     counts = pd.Series([r["predicted_cause"] for r in results]).value_counts().to_dict()
     return {
