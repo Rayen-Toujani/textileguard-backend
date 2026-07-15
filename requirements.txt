@@ -4,7 +4,8 @@ python-multipart==0.0.6
 pillow==12.2.0
 torch==2.1.0
 torchvision==0.16.0
-ultralytics==8.1.20
+# 8.4.95+ required -- YOLO11 architecture (C3k2 blocks) isn't present in earlier versions
+ultralytics==8.4.95
 opencv-python-headless==4.8.1.78
 numpy==1.26.4
 pydantic==2.11.7
