@@ -5,45 +5,39 @@ from pydantic import BaseModel
 from PIL import Image, ImageDraw
 import asyncio
 import cv2
-import gc
 import io
+import json
 import os
 import base64
+import sys
 import tempfile
 import time
 from typing import List, Optional
 import pandas as pd
 from datetime import datetime
-from ultralytics import YOLO
 
-from model import predict_image
 from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 from root_cause_classifier import RootCauseClassifier
 from report_enrichment import enrich_report_for_root_cause
-from garment_detector import GarmentDetector
 from video_frames import extract_distinct_frames
 from auth import get_current_user_optional, verify_supabase_token, CurrentUser
 from training_data import save_upload_and_prediction, save_upload, save_prediction
 
 _root_cause_model: "RootCauseClassifier | None" = None
 
-# Model 1 (YOLOv8 defect detector, best.pt) and the Part 3 garment detector
-# (YOLO11s, bestYOLO11model.pt) are the two YOLO models in this app. Render's
-# 512MB ceiling can't hold both resident at once (confirmed via production
-# OOM), so only one is ever loaded at a time: get_defect_model() and
-# get_garment_detector() below each unload the OTHER before loading their
-# own model. Whichever was used most recently stays warm; switching between
-# them pays a reload cost, which is an acceptable tradeoff since they're
-# separate UI tabs rarely called back-to-back.
-#
-# Both share ONE lock rather than one each: the swap (unload other, load
-# self) has to be atomic with respect to BOTH functions, or two requests
-# for different models arriving at once could each unload what the other
-# just loaded.
-_defect_model: "YOLO | None" = None
-_garment_detector: "GarmentDetector | None" = None
-_yolo_swap_lock = asyncio.Lock()
+# Both YOLO models (Model 1's defect detector and the Part 3 garment
+# detector) run entirely in a separate subprocess per inference call (see
+# _run_inference_subprocess and run_yolo_inference.py) — this process never
+# imports ultralytics/torch or holds either model in memory. This replaced
+# an earlier in-process "lazy load + unload the other" approach: dropping a
+# model's Python reference and calling gc.collect() doesn't reliably return
+# glibc-allocated heap back to the OS within a live process, so loading the
+# second model on top of the first's still-elevated RSS kept OOM'ing on
+# Render's 512MB ceiling even with only one model "loaded" at a time.
+# Process exit is the one thing guaranteed to reclaim everything.
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+INFERENCE_SUBPROCESS_TIMEOUT_SECONDS = 150
 
 # Render's request/memory budget is limited — cap uploads so a single
 # request can't hang the service or exhaust its memory on a long/huge video.
@@ -108,69 +102,70 @@ async def load_models():
         except Exception as e:
             print(f"⚠ Root cause model load failed: {e}")
 
-    # Garment detector is deliberately NOT loaded here (unlike the other
-    # three models) -- see get_garment_detector() below. Loading all four
-    # models at startup pushed idle memory over Render's 512MB ceiling in
-    # production; the garment detector is now lazy-loaded on first use.
+    # Neither YOLO model loads here -- see the module-level comment above.
+    # Only the stain classifier and root-cause model (never part of the
+    # memory problem) are loaded at startup.
 
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _load_stain)
     loop.run_in_executor(None, _load_root_cause)
 
 
-async def get_defect_model() -> YOLO:
+async def _run_inference_subprocess(
+    model: str, image_path: str, conf: float = 0.5, imgsz: int = 640
+) -> dict:
     """
-    Lazy-loaded singleton for Model 1 (YOLOv8 defect detector, best.pt).
-    Mutually exclusive with get_garment_detector(): unloads the garment
-    detector first if it's currently resident, so only one YOLO model is
-    ever loaded at once (see the module-level comment above for why).
+    Run run_yolo_inference.py in a fresh subprocess for a single image and
+    return its parsed JSON output. The subprocess loads exactly one model,
+    runs one inference call, writes its result, and exits -- process exit
+    is what guarantees the memory it used is actually returned to the OS
+    (see run_yolo_inference.py's module docstring).
 
-    Raises whatever YOLO(...) raises -- callers should catch and translate
-    to an HTTP error rather than let it surface as a raw 500.
+    Raises RuntimeError on timeout, non-zero exit, or malformed output --
+    callers should catch and translate to an HTTP error.
     """
-    global _defect_model, _garment_detector
-    if _defect_model is not None:
-        return _defect_model
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as out_f:
+        output_path = out_f.name
 
-    async with _yolo_swap_lock:
-        if _defect_model is None:  # re-check: another request may have loaded it while we awaited the lock
-            if _garment_detector is not None:
-                _garment_detector = None
-                gc.collect()
-                print("[MEMORY] unloaded garment detector to load defect model")
-            t0 = time.time()
-            _defect_model = await asyncio.to_thread(YOLO, "best.pt")
-            print(f"[TIMING] defect_model_load: {time.time() - t0:.2f}s")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "run_yolo_inference.py",
+            "--model", model,
+            "--image", image_path,
+            "--output", output_path,
+            "--conf", str(conf),
+            "--imgsz", str(imgsz),
+            cwd=BACKEND_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=INFERENCE_SUBPROCESS_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(
+                f"{model} inference subprocess timed out after {INFERENCE_SUBPROCESS_TIMEOUT_SECONDS}s"
+            )
 
-    return _defect_model
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"{model} inference subprocess failed (exit {proc.returncode}): "
+                f"{stderr.decode(errors='replace')[:2000]}"
+            )
 
+        try:
+            with open(output_path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"{model} inference subprocess produced malformed output: {e}")
 
-async def get_garment_detector() -> GarmentDetector:
-    """
-    Lazy-loaded singleton for the Part 3 garment detector (YOLO11s,
-    bestYOLO11model.pt). Mutually exclusive with get_defect_model(): unloads
-    the defect model first if it's currently resident -- see the
-    module-level comment above for why.
-
-    Raises whatever GarmentDetector(...) raises (e.g. FileNotFoundError if
-    weights are missing) -- callers should catch and translate to an HTTP
-    error rather than let it surface as a raw 500.
-    """
-    global _garment_detector, _defect_model
-    if _garment_detector is not None:
-        return _garment_detector
-
-    async with _yolo_swap_lock:
-        if _garment_detector is None:  # re-check: another request may have loaded it while we awaited the lock
-            if _defect_model is not None:
-                _defect_model = None
-                gc.collect()
-                print("[MEMORY] unloaded defect model to load garment detector")
-            t0 = time.time()
-            _garment_detector = await asyncio.to_thread(GarmentDetector)
-            print(f"[TIMING] garment_detector_load: {time.time() - t0:.2f}s")
-
-    return _garment_detector
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
@@ -208,15 +203,28 @@ def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     
     return annotated
 
-def _run_yolo(image_bytes: bytes, model: YOLO) -> dict:
+async def _run_yolo(image_bytes: bytes) -> dict:
     """
-    Run YOLO defect detection on raw image bytes. Blocking — call via
-    asyncio.to_thread. `model` is resolved by the caller via
-    get_defect_model() (async) before dispatching here.
+    Run YOLO defect detection on raw image bytes. Inference itself happens
+    in an isolated subprocess (see _run_inference_subprocess) — the main
+    process never holds the defect model; only the lightweight PIL
+    pre/post-processing here runs inline.
     """
     original_image = Image.open(io.BytesIO(image_bytes))
     processed_image = preprocess_single_patch(original_image)
-    predictions = predict_image(processed_image, model)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+            processed_image.save(tmp_path, format="JPEG")
+
+        result = await _run_inference_subprocess("defect", tmp_path)
+        predictions = result.get("predictions", [])
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
     annotated_image = draw_defects_on_image(processed_image, predictions)
 
     buffered = io.BytesIO()
@@ -286,8 +294,7 @@ async def predict(
     """Single image prediction"""
     try:
         contents = await file.read()
-        model = await get_defect_model()
-        yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
+        yolo_result = await _run_yolo(contents)
 
         top_pred = yolo_result["predictions"][0] if yolo_result["predictions"] else None
         save_upload_and_prediction(
@@ -317,12 +324,11 @@ async def batch_predict(
     """Batch image prediction"""
     try:
         results = []
-        model = await get_defect_model()
 
         for idx, file in enumerate(files):
             try:
                 contents = await file.read()
-                yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
+                yolo_result = await _run_yolo(contents)
                 predictions = yolo_result["predictions"]
 
                 # Get top prediction
@@ -538,8 +544,7 @@ async def analyze(
     """
     try:
         contents = await file.read()
-        model = await get_defect_model()
-        yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
+        yolo_result = await _run_yolo(contents)
     except Exception as e:
         import traceback
         print(f"Error: {str(e)}")
@@ -598,12 +603,11 @@ async def analyze_batch(
     """
     user_id = current_user.id if current_user else None
     results = []
-    model = await get_defect_model()
 
     for idx, file in enumerate(files):
         try:
             contents = await file.read()
-            yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
+            yolo_result = await _run_yolo(contents)
             predictions = yolo_result["predictions"]
             top_pred = predictions[0] if predictions else {"class": "unknown", "confidence": 0}
 
@@ -828,26 +832,22 @@ def _evenly_spaced_indices(n: int, k: int) -> list[int]:
     return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
 
 
-def _process_video(
-    tmp_path: str, user_id: Optional[str], original_filename: Optional[str], detector: GarmentDetector
-) -> dict:
+async def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Optional[str]) -> dict:
     """
-    Blocking: sample+de-dup frames, detect garments per frame, and save one
-    uploads/predictions row per detected garment (not per frame). Call via
-    asyncio.to_thread — cv2 decoding, model inference, and the Supabase
-    writes below are all synchronous. `detector` is passed in (already
-    resolved via get_garment_detector()) rather than read off the module
-    global, since loading it is now lazy and async.
+    Sample+de-dup frames, detect garments per frame (each frame's inference
+    runs in its own isolated subprocess — see _run_inference_subprocess —
+    so the main process never holds the garment detector), and save one
+    uploads/predictions row per detected garment (not per frame).
 
     TEMPORARY: per-stage [TIMING] logging below, added to diagnose a
     production timeout on this endpoint (grep Render logs for "[TIMING]").
-    Remove once the slow stage is identified and fixed.
+    Remove once no longer needed for debugging.
     """
     request_start = time.time()
 
     t0 = time.time()
-    kept_frames, total_sampled = extract_distinct_frames(
-        tmp_path, interval_seconds=VIDEO_SAMPLE_INTERVAL_SECONDS, similarity_threshold=0.95
+    kept_frames, total_sampled = await asyncio.to_thread(
+        extract_distinct_frames, tmp_path, VIDEO_SAMPLE_INTERVAL_SECONDS, 0.95
     )
     print(f"[TIMING] frame_extraction: {time.time() - t0:.2f}s (sampled={total_sampled}, kept={len(kept_frames)})")
 
@@ -862,9 +862,19 @@ def _process_video(
     detections_out = []
 
     for frame_num, (frame, frame_index, timestamp_seconds) in enumerate(frames_to_process):
-        t0 = time.time()
-        dets = detector.detect_and_crop(frame)
-        print(f"[TIMING] garment_inference frame={frame_num}: {time.time() - t0:.2f}s ({len(dets)} detections)")
+        frame_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                frame_path = f.name
+            await asyncio.to_thread(cv2.imwrite, frame_path, frame)
+
+            t0 = time.time()
+            result = await _run_inference_subprocess("garment", frame_path)
+            dets = result.get("detections", [])
+            print(f"[TIMING] garment_inference frame={frame_num}: {time.time() - t0:.2f}s ({len(dets)} detections)")
+        finally:
+            if frame_path and os.path.exists(frame_path):
+                os.remove(frame_path)
 
         for det in dets:
             class_name = det["class_name"]
@@ -873,22 +883,20 @@ def _process_video(
             result_json = {
                 "class_name": class_name,
                 "confidence": det["confidence"],
-                "bbox": list(det["bbox"]),
+                "bbox": det["bbox"],
                 "frame_index": frame_index,
                 "timestamp_seconds": round(timestamp_seconds, 2),
                 "source_video_filename": original_filename,
             }
 
-            t0 = time.time()
-            ok, buf = cv2.imencode(".jpg", det["cropped_image"])
-            print(f"[TIMING] image_encode frame={frame_num}: {time.time() - t0:.2f}s")
-
             upload_id = None
-            if ok:
+            crop_b64 = det.get("cropped_image_b64")
+            if crop_b64:
                 t0 = time.time()
-                upload_id = save_upload(
+                upload_id = await asyncio.to_thread(
+                    save_upload,
                     user_id=user_id,
-                    file_bytes=buf.tobytes(),
+                    file_bytes=base64.b64decode(crop_b64),
                     original_filename=f"garment_{class_name}_t{timestamp_seconds:.1f}s.jpg",
                     file_type="image",
                     model_context="garment_extraction",
@@ -896,7 +904,8 @@ def _process_video(
                 print(f"[TIMING] save_upload_total frame={frame_num}: {time.time() - t0:.2f}s")
 
             t0 = time.time()
-            save_prediction(
+            await asyncio.to_thread(
+                save_prediction,
                 user_id=user_id,
                 upload_id=upload_id,
                 model_used="garment_detector",
@@ -944,12 +953,13 @@ async def analyze_video(
     Frames are streamed off disk one at a time by extract_distinct_frames —
     the whole video is never held in memory.
 
-    The garment detector itself is lazy-loaded (get_garment_detector) —
-    unlike the other three models, it is NOT loaded at startup, since all
-    four resident at once pushed idle memory over Render's 512MB ceiling.
-    The first call after a cold start pays the model-load cost on top of
-    inference; every call after that reuses the cached instance for the
-    lifetime of the process.
+    The garment detector never loads in this process — each frame's
+    inference runs in its own subprocess (see _run_inference_subprocess),
+    which loads the model, runs one inference call, and exits. This trades
+    per-frame speed (every frame pays a fresh model-load cost, no warm
+    reuse across frames within one request) for a hard memory guarantee:
+    process exit is what actually returns memory to the OS, unlike an
+    in-process "unload" attempt (confirmed insufficient in production).
 
     Response: {
         "frames_processed": int,            # raw frames sampled at the interval, before de-dup
@@ -961,13 +971,6 @@ async def analyze_video(
         "detections": [...]                 # one entry per detected garment
     }
     """
-    t0 = time.time()
-    try:
-        detector = await get_garment_detector()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Garment detector unavailable: {e}")
-    print(f"[TIMING] garment_detector_load_or_cached: {time.time() - t0:.2f}s")
-
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     tmp_path = None
     try:
@@ -991,7 +994,7 @@ async def analyze_video(
             )
 
         user_id = current_user.id if current_user else None
-        return await asyncio.to_thread(_process_video, tmp_path, user_id, file.filename, detector)
+        return await _process_video(tmp_path, user_id, file.filename)
 
     except HTTPException:
         raise
