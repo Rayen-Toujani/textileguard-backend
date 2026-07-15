@@ -2,8 +2,17 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 pillow==12.2.0
-torch==2.1.0
-torchvision==0.16.0
+# torch/torchvision are deliberately NOT listed here -- the Dockerfile
+# installs them separately from PyTorch's CPU-only wheel index before this
+# file is processed. Pinning them here too (even at the same version, with
+# no index override) let a bare `pip install -r requirements.txt` decide
+# the exact-match "==2.1.0" wasn't satisfied by the installed "2.1.0+cpu"
+# local version and reinstall torch from PyPI's default index -- which
+# bundles the full CUDA stack (nvidia-cublas-cu12, nvidia-cudnn-cu12,
+# triton, etc.) even though Render has no GPU. ultralytics' own
+# torch>=1.8.0 constraint below is a minimum-version check, which doesn't
+# hit this ambiguity, so it's safe to let it be the only thing referencing
+# torch in this file.
 # 8.4.95+ required -- YOLO11 architecture (C3k2 blocks) isn't present in earlier versions
 ultralytics==8.4.95
 opencv-python-headless==4.8.1.78
