@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from PIL import Image, ImageDraw
 import asyncio
 import cv2
+import gc
 import io
 import os
 import base64
@@ -13,6 +14,7 @@ import time
 from typing import List, Optional
 import pandas as pd
 from datetime import datetime
+from ultralytics import YOLO
 
 from model import predict_image
 from preprocessing import preprocess_single_patch
@@ -26,17 +28,22 @@ from training_data import save_upload_and_prediction, save_upload, save_predicti
 
 _root_cause_model: "RootCauseClassifier | None" = None
 
-# Garment detector is lazy-loaded (see get_garment_detector) rather than
-# loaded at startup like the other three models -- see load_models() below
-# for why. _garment_detector_lock guards the load-if-none-cached check:
-# the load itself runs via asyncio.to_thread so it doesn't block the event
-# loop for unrelated concurrent requests, which means there's an await
-# point between the None-check and the assignment -- without the lock, two
-# requests arriving before the first load finishes would both see None and
-# each load their own instance (wasteful, and briefly doubles memory right
-# when we're trying to avoid exactly that).
+# Model 1 (YOLOv8 defect detector, best.pt) and the Part 3 garment detector
+# (YOLO11s, bestYOLO11model.pt) are the two YOLO models in this app. Render's
+# 512MB ceiling can't hold both resident at once (confirmed via production
+# OOM), so only one is ever loaded at a time: get_defect_model() and
+# get_garment_detector() below each unload the OTHER before loading their
+# own model. Whichever was used most recently stays warm; switching between
+# them pays a reload cost, which is an acceptable tradeoff since they're
+# separate UI tabs rarely called back-to-back.
+#
+# Both share ONE lock rather than one each: the swap (unload other, load
+# self) has to be atomic with respect to BOTH functions, or two requests
+# for different models arriving at once could each unload what the other
+# just loaded.
+_defect_model: "YOLO | None" = None
 _garment_detector: "GarmentDetector | None" = None
-_garment_detector_lock = asyncio.Lock()
+_yolo_swap_lock = asyncio.Lock()
 
 # Render's request/memory budget is limited — cap uploads so a single
 # request can't hang the service or exhaust its memory on a long/huge video.
@@ -111,24 +118,57 @@ async def load_models():
     loop.run_in_executor(None, _load_root_cause)
 
 
+async def get_defect_model() -> YOLO:
+    """
+    Lazy-loaded singleton for Model 1 (YOLOv8 defect detector, best.pt).
+    Mutually exclusive with get_garment_detector(): unloads the garment
+    detector first if it's currently resident, so only one YOLO model is
+    ever loaded at once (see the module-level comment above for why).
+
+    Raises whatever YOLO(...) raises -- callers should catch and translate
+    to an HTTP error rather than let it surface as a raw 500.
+    """
+    global _defect_model, _garment_detector
+    if _defect_model is not None:
+        return _defect_model
+
+    async with _yolo_swap_lock:
+        if _defect_model is None:  # re-check: another request may have loaded it while we awaited the lock
+            if _garment_detector is not None:
+                _garment_detector = None
+                gc.collect()
+                print("[MEMORY] unloaded garment detector to load defect model")
+            t0 = time.time()
+            _defect_model = await asyncio.to_thread(YOLO, "best.pt")
+            print(f"[TIMING] defect_model_load: {time.time() - t0:.2f}s")
+
+    return _defect_model
+
+
 async def get_garment_detector() -> GarmentDetector:
     """
-    Lazy-loaded singleton for the garment detector -- returns the cached
-    instance if already loaded, otherwise loads it once and caches it for
-    the lifetime of the process (same end state as the other three models,
-    just deferred until first use instead of paid at startup).
+    Lazy-loaded singleton for the Part 3 garment detector (YOLO11s,
+    bestYOLO11model.pt). Mutually exclusive with get_defect_model(): unloads
+    the defect model first if it's currently resident -- see the
+    module-level comment above for why.
 
     Raises whatever GarmentDetector(...) raises (e.g. FileNotFoundError if
     weights are missing) -- callers should catch and translate to an HTTP
     error rather than let it surface as a raw 500.
     """
-    global _garment_detector
+    global _garment_detector, _defect_model
     if _garment_detector is not None:
         return _garment_detector
 
-    async with _garment_detector_lock:
+    async with _yolo_swap_lock:
         if _garment_detector is None:  # re-check: another request may have loaded it while we awaited the lock
+            if _defect_model is not None:
+                _defect_model = None
+                gc.collect()
+                print("[MEMORY] unloaded defect model to load garment detector")
+            t0 = time.time()
             _garment_detector = await asyncio.to_thread(GarmentDetector)
+            print(f"[TIMING] garment_detector_load: {time.time() - t0:.2f}s")
 
     return _garment_detector
 
@@ -168,11 +208,15 @@ def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     
     return annotated
 
-def _run_yolo(image_bytes: bytes) -> dict:
-    """Run YOLO defect detection on raw image bytes. Blocking — call via asyncio.to_thread."""
+def _run_yolo(image_bytes: bytes, model: YOLO) -> dict:
+    """
+    Run YOLO defect detection on raw image bytes. Blocking — call via
+    asyncio.to_thread. `model` is resolved by the caller via
+    get_defect_model() (async) before dispatching here.
+    """
     original_image = Image.open(io.BytesIO(image_bytes))
     processed_image = preprocess_single_patch(original_image)
-    predictions = predict_image(processed_image)
+    predictions = predict_image(processed_image, model)
     annotated_image = draw_defects_on_image(processed_image, predictions)
 
     buffered = io.BytesIO()
@@ -242,7 +286,8 @@ async def predict(
     """Single image prediction"""
     try:
         contents = await file.read()
-        yolo_result = await asyncio.to_thread(_run_yolo, contents)
+        model = await get_defect_model()
+        yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
 
         top_pred = yolo_result["predictions"][0] if yolo_result["predictions"] else None
         save_upload_and_prediction(
@@ -272,11 +317,12 @@ async def batch_predict(
     """Batch image prediction"""
     try:
         results = []
+        model = await get_defect_model()
 
         for idx, file in enumerate(files):
             try:
                 contents = await file.read()
-                yolo_result = await asyncio.to_thread(_run_yolo, contents)
+                yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
                 predictions = yolo_result["predictions"]
 
                 # Get top prediction
@@ -492,7 +538,8 @@ async def analyze(
     """
     try:
         contents = await file.read()
-        yolo_result = await asyncio.to_thread(_run_yolo, contents)
+        model = await get_defect_model()
+        yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
     except Exception as e:
         import traceback
         print(f"Error: {str(e)}")
@@ -551,11 +598,12 @@ async def analyze_batch(
     """
     user_id = current_user.id if current_user else None
     results = []
+    model = await get_defect_model()
 
     for idx, file in enumerate(files):
         try:
             contents = await file.read()
-            yolo_result = await asyncio.to_thread(_run_yolo, contents)
+            yolo_result = await asyncio.to_thread(_run_yolo, contents, model)
             predictions = yolo_result["predictions"]
             top_pred = predictions[0] if predictions else {"class": "unknown", "confidence": 0}
 
