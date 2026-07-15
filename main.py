@@ -4,9 +4,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from PIL import Image, ImageDraw
 import asyncio
+import cv2
 import io
 import os
 import base64
+import tempfile
 from typing import List, Optional
 import pandas as pd
 from datetime import datetime
@@ -16,10 +18,18 @@ from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 from root_cause_classifier import RootCauseClassifier
 from report_enrichment import enrich_report_for_root_cause
+from garment_detector import GarmentDetector
+from video_frames import extract_distinct_frames
 from auth import get_current_user_optional, verify_supabase_token, CurrentUser
 from training_data import save_upload_and_prediction, save_upload, save_prediction
 
 _root_cause_model: "RootCauseClassifier | None" = None
+_garment_detector: "GarmentDetector | None" = None
+
+# Render's request/memory budget is limited — cap uploads so a single
+# request can't hang the service or exhaust its memory on a long/huge video.
+MAX_VIDEO_BYTES = 50 * 1024 * 1024  # 50MB
+MAX_VIDEO_DURATION_SECONDS = 60
 
 
 class DefectRecord(BaseModel):
@@ -69,9 +79,20 @@ async def load_models():
         except Exception as e:
             print(f"⚠ Root cause model load failed: {e}")
 
+    def _load_garment_detector():
+        global _garment_detector
+        try:
+            _garment_detector = GarmentDetector()
+            print("✓ Garment detector loaded on startup")
+        except FileNotFoundError as e:
+            print(f"⚠ Garment detector model not found (Part 3 disabled): {e}")
+        except Exception as e:
+            print(f"⚠ Garment detector load failed: {e}")
+
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _load_stain)
     loop.run_in_executor(None, _load_root_cause)
+    loop.run_in_executor(None, _load_garment_detector)
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     """Draw circles around detected defects"""
@@ -692,6 +713,144 @@ async def predict_cause_batch(
         "results": results,
         "summary": {"total": len(results), "cause_counts": counts},
     }
+
+
+def _video_duration_seconds(path: str) -> Optional[float]:
+    """Best-effort video duration from container metadata; None if unavailable/unreliable."""
+    cap = cv2.VideoCapture(path)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if fps and fps > 0 and frame_count and frame_count > 0:
+            return frame_count / fps
+        return None
+    finally:
+        cap.release()
+
+
+def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Optional[str]) -> dict:
+    """
+    Blocking: sample+de-dup frames, detect garments per frame, and save one
+    uploads/predictions row per detected garment (not per frame). Call via
+    asyncio.to_thread — cv2 decoding, model inference, and the Supabase
+    writes below are all synchronous.
+    """
+    kept_frames, total_sampled = extract_distinct_frames(
+        tmp_path, interval_seconds=1.0, similarity_threshold=0.95
+    )
+
+    by_class: dict[str, int] = {}
+    detections_out = []
+
+    for frame, frame_index, timestamp_seconds in kept_frames:
+        for det in _garment_detector.detect_and_crop(frame):
+            class_name = det["class_name"]
+            by_class[class_name] = by_class.get(class_name, 0) + 1
+
+            result_json = {
+                "class_name": class_name,
+                "confidence": det["confidence"],
+                "bbox": list(det["bbox"]),
+                "frame_index": frame_index,
+                "timestamp_seconds": round(timestamp_seconds, 2),
+                "source_video_filename": original_filename,
+            }
+
+            ok, buf = cv2.imencode(".jpg", det["cropped_image"])
+            upload_id = None
+            if ok:
+                upload_id = save_upload(
+                    user_id=user_id,
+                    file_bytes=buf.tobytes(),
+                    original_filename=f"garment_{class_name}_t{timestamp_seconds:.1f}s.jpg",
+                    file_type="image",
+                    model_context="garment_extraction",
+                )
+
+            save_prediction(
+                user_id=user_id,
+                upload_id=upload_id,
+                model_used="garment_detector",
+                result_json=result_json,
+                confidence=det["confidence"],
+            )
+
+            detections_out.append(result_json)
+
+    return {
+        "frames_processed": total_sampled,
+        "distinct_frames_kept": len(kept_frames),
+        "garments_detected": len(detections_out),
+        "by_class": by_class,
+        "detections": detections_out,
+    }
+
+
+@app.post("/api/analyze-video")
+async def analyze_video(
+    file: UploadFile = File(...),
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
+    """
+    Part 3: detect and crop garments from a short video.
+
+    Samples frames from the uploaded video at a fixed 1s interval, drops
+    near-duplicate consecutive frames (see video_frames.py), runs garment
+    detection on each surviving frame, and saves the CROPPED garment image
+    (not the full frame) for each individual detection — a frame with 2
+    garments produces 2 uploads/predictions rows.
+
+    The upload is capped at MAX_VIDEO_BYTES and MAX_VIDEO_DURATION_SECONDS
+    (Render has limited request time/memory; an unbounded video could hang
+    or OOM the service). Frames are streamed off disk one at a time by
+    extract_distinct_frames — the whole video is never held in memory.
+
+    Response: {
+        "frames_processed": int,       # raw frames sampled at the 1s interval, before de-dup
+        "distinct_frames_kept": int,   # frames remaining after de-dup
+        "garments_detected": int,
+        "by_class": {class_name: count, ...},
+        "detections": [...]            # one entry per detected garment
+    }
+    """
+    if _garment_detector is None:
+        raise HTTPException(status_code=503, detail="Garment detector not loaded")
+
+    suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            total_bytes = 0
+            while chunk := await file.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_VIDEO_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Video exceeds the {MAX_VIDEO_BYTES // (1024 * 1024)}MB upload limit",
+                    )
+                tmp.write(chunk)
+
+        duration = await asyncio.to_thread(_video_duration_seconds, tmp_path)
+        if duration is not None and duration > MAX_VIDEO_DURATION_SECONDS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Video exceeds the {MAX_VIDEO_DURATION_SECONDS}s duration limit ({duration:.1f}s)",
+            )
+
+        user_id = current_user.id if current_user else None
+        return await asyncio.to_thread(_process_video, tmp_path, user_id, file.filename)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Error in analyze_video: {str(e)}")
+        print(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 if __name__ == "__main__":
