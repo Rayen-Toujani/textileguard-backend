@@ -31,6 +31,16 @@ _garment_detector: "GarmentDetector | None" = None
 MAX_VIDEO_BYTES = 50 * 1024 * 1024  # 50MB
 MAX_VIDEO_DURATION_SECONDS = 60
 
+# CPU-only garment-detector inference is the dominant per-request cost
+# (confirmed in production: a single frame's inference took long enough to
+# blow past Render's platform timeout). These bound the per-request workload
+# independently of video length: a wider sampling interval means fewer raw
+# frames to even consider, and the hard cap below is a last-resort backstop
+# in case dedup still leaves more distinct frames than is safe to run
+# detection on in one request.
+VIDEO_SAMPLE_INTERVAL_SECONDS = 2.5
+MAX_FRAMES_TO_PROCESS = 10
+
 
 class DefectRecord(BaseModel):
     defect_type: str
@@ -728,6 +738,19 @@ def _video_duration_seconds(path: str) -> Optional[float]:
         cap.release()
 
 
+def _evenly_spaced_indices(n: int, k: int) -> list[int]:
+    """
+    Pick up to k indices spread evenly across range(n), preserving order.
+    Used to cap frame processing while keeping coverage of the whole video
+    rather than just its first k seconds.
+    """
+    if k >= n:
+        return list(range(n))
+    if k <= 1:
+        return [0]
+    return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+
+
 def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Optional[str]) -> dict:
     """
     Blocking: sample+de-dup frames, detect garments per frame, and save one
@@ -736,13 +759,20 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
     writes below are all synchronous.
     """
     kept_frames, total_sampled = extract_distinct_frames(
-        tmp_path, interval_seconds=1.0, similarity_threshold=0.95
+        tmp_path, interval_seconds=VIDEO_SAMPLE_INTERVAL_SECONDS, similarity_threshold=0.95
     )
+
+    frame_cap_applied = len(kept_frames) > MAX_FRAMES_TO_PROCESS
+    if frame_cap_applied:
+        indices = _evenly_spaced_indices(len(kept_frames), MAX_FRAMES_TO_PROCESS)
+        frames_to_process = [kept_frames[i] for i in indices]
+    else:
+        frames_to_process = kept_frames
 
     by_class: dict[str, int] = {}
     detections_out = []
 
-    for frame, frame_index, timestamp_seconds in kept_frames:
+    for frame, frame_index, timestamp_seconds in frames_to_process:
         for det in _garment_detector.detect_and_crop(frame):
             class_name = det["class_name"]
             by_class[class_name] = by_class.get(class_name, 0) + 1
@@ -780,6 +810,8 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
     return {
         "frames_processed": total_sampled,
         "distinct_frames_kept": len(kept_frames),
+        "detection_frames_processed": len(frames_to_process),
+        "frame_cap_applied": frame_cap_applied,
         "garments_detected": len(detections_out),
         "by_class": by_class,
         "detections": detections_out,
@@ -794,23 +826,30 @@ async def analyze_video(
     """
     Part 3: detect and crop garments from a short video.
 
-    Samples frames from the uploaded video at a fixed 1s interval, drops
-    near-duplicate consecutive frames (see video_frames.py), runs garment
-    detection on each surviving frame, and saves the CROPPED garment image
-    (not the full frame) for each individual detection — a frame with 2
-    garments produces 2 uploads/predictions rows.
+    Samples frames from the uploaded video at a fixed
+    VIDEO_SAMPLE_INTERVAL_SECONDS interval, drops near-duplicate consecutive
+    frames (see video_frames.py), runs garment detection on each surviving
+    frame (up to MAX_FRAMES_TO_PROCESS of them — see _process_video), and
+    saves the CROPPED garment image (not the full frame) for each individual
+    detection — a frame with 2 garments produces 2 uploads/predictions rows.
 
-    The upload is capped at MAX_VIDEO_BYTES and MAX_VIDEO_DURATION_SECONDS
-    (Render has limited request time/memory; an unbounded video could hang
-    or OOM the service). Frames are streamed off disk one at a time by
-    extract_distinct_frames — the whole video is never held in memory.
+    The upload is capped at MAX_VIDEO_BYTES and MAX_VIDEO_DURATION_SECONDS,
+    and per-request inference work is separately capped at
+    MAX_FRAMES_TO_PROCESS regardless of how many distinct frames dedup
+    leaves — CPU-only garment-detector inference is the dominant per-request
+    cost, and Render has a limited request-time budget (confirmed in
+    production: a single frame's inference was slow enough to exceed it).
+    Frames are streamed off disk one at a time by extract_distinct_frames —
+    the whole video is never held in memory.
 
     Response: {
-        "frames_processed": int,       # raw frames sampled at the 1s interval, before de-dup
-        "distinct_frames_kept": int,   # frames remaining after de-dup
+        "frames_processed": int,            # raw frames sampled at the interval, before de-dup
+        "distinct_frames_kept": int,        # frames remaining after de-dup
+        "detection_frames_processed": int,  # of those, how many were actually run through the detector
+        "frame_cap_applied": bool,          # true if distinct_frames_kept > MAX_FRAMES_TO_PROCESS
         "garments_detected": int,
         "by_class": {class_name: count, ...},
-        "detections": [...]            # one entry per detected garment
+        "detections": [...]                 # one entry per detected garment
     }
     """
     if _garment_detector is None:

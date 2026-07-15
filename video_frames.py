@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 _SIMILARITY_DOWNSCALE_SIZE = (64, 64)
 
 
-def extract_frames(video_path: str, interval_seconds: float = 1.0) -> Iterator[tuple[np.ndarray, int, float]]:
+def extract_frames(video_path: str, interval_seconds: float = 2.5) -> Iterator[tuple[np.ndarray, int, float]]:
     """
     Sample frames from a video at a fixed time interval.
 
@@ -97,7 +97,7 @@ def _to_small_gray(frame: np.ndarray) -> np.ndarray:
 
 def extract_distinct_frames(
     video_path: str,
-    interval_seconds: float = 1.0,
+    interval_seconds: float = 2.5,
     similarity_threshold: float = 0.95,
 ) -> tuple[list[tuple[np.ndarray, int, float]], int]:
     """
@@ -143,7 +143,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     video_path_arg = sys.argv[1]
-    interval_arg = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    interval_arg = float(sys.argv[2]) if len(sys.argv) > 2 else 2.5
     similarity_arg = float(sys.argv[3]) if len(sys.argv) > 3 else 0.95
 
     distinct_frames, total_sampled = extract_distinct_frames(
