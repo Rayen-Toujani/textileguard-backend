@@ -52,7 +52,7 @@ class GarmentDetector:
         self.class_names: dict[int, str] = self.model.names
 
     def detect_and_crop(
-        self, image: np.ndarray, conf_threshold: float = 0.5
+        self, image: np.ndarray, conf_threshold: float = 0.5, imgsz: int = 384
     ) -> list[dict[str, Any]]:
         """
         Run garment detection on a single image and crop each detected region.
@@ -62,6 +62,13 @@ class GarmentDetector:
                 cv2.VideoCapture/cv2.imread (BGR) -- channel order is
                 preserved as-is into the crop.
             conf_threshold: minimum detection confidence to keep a result.
+            imgsz: side length (px) ultralytics resizes the image to before
+                inference. Lower uses less memory/CPU per call at some cost
+                to small-object recall; 384 (down from ultralytics' default
+                640) was chosen to fit CPU-only inference in Render's
+                512MB memory ceiling -- see backend deploy notes. bbox/crop
+                coordinates are always returned in the original image's
+                pixel space regardless of imgsz.
 
         Returns:
             A list of dicts, one per detection above conf_threshold:
@@ -75,7 +82,7 @@ class GarmentDetector:
         if image is None or image.size == 0:
             raise ValueError("image must be a non-empty numpy array")
 
-        results = self.model.predict(image, conf=conf_threshold, verbose=False)
+        results = self.model.predict(image, conf=conf_threshold, imgsz=imgsz, verbose=False)
         result = results[0]
 
         detections: list[dict[str, Any]] = []
