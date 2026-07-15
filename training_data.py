@@ -8,6 +8,7 @@ that must never affect the response the caller is waiting on.
 
 import logging
 import mimetypes
+import time
 from typing import Optional
 from uuid import uuid4
 
@@ -48,12 +49,17 @@ def save_upload(
         )
         content_type = mimetypes.guess_type(original_filename or "")[0] or "application/octet-stream"
 
+        # TEMPORARY: split [TIMING] logging to diagnose a production timeout
+        # on /api/analyze-video -- remove once the slow stage is identified.
+        t0 = time.time()
         client.storage.from_(UPLOADS_BUCKET).upload(
             storage_path,
             file_bytes,
             {"content-type": content_type},
         )
+        print(f"[TIMING] save_upload.storage_upload: {time.time() - t0:.2f}s")
 
+        t0 = time.time()
         upload_row = (
             client.table("uploads")
             .insert(
@@ -67,6 +73,7 @@ def save_upload(
             )
             .execute()
         )
+        print(f"[TIMING] save_upload.table_insert: {time.time() - t0:.2f}s")
         return upload_row.data[0]["id"]
 
     except Exception:

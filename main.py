@@ -9,6 +9,7 @@ import io
 import os
 import base64
 import tempfile
+import time
 from typing import List, Optional
 import pandas as pd
 from datetime import datetime
@@ -757,10 +758,18 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
     uploads/predictions row per detected garment (not per frame). Call via
     asyncio.to_thread — cv2 decoding, model inference, and the Supabase
     writes below are all synchronous.
+
+    TEMPORARY: per-stage [TIMING] logging below, added to diagnose a
+    production timeout on this endpoint (grep Render logs for "[TIMING]").
+    Remove once the slow stage is identified and fixed.
     """
+    request_start = time.time()
+
+    t0 = time.time()
     kept_frames, total_sampled = extract_distinct_frames(
         tmp_path, interval_seconds=VIDEO_SAMPLE_INTERVAL_SECONDS, similarity_threshold=0.95
     )
+    print(f"[TIMING] frame_extraction: {time.time() - t0:.2f}s (sampled={total_sampled}, kept={len(kept_frames)})")
 
     frame_cap_applied = len(kept_frames) > MAX_FRAMES_TO_PROCESS
     if frame_cap_applied:
@@ -772,8 +781,12 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
     by_class: dict[str, int] = {}
     detections_out = []
 
-    for frame, frame_index, timestamp_seconds in frames_to_process:
-        for det in _garment_detector.detect_and_crop(frame):
+    for frame_num, (frame, frame_index, timestamp_seconds) in enumerate(frames_to_process):
+        t0 = time.time()
+        dets = _garment_detector.detect_and_crop(frame)
+        print(f"[TIMING] garment_inference frame={frame_num}: {time.time() - t0:.2f}s ({len(dets)} detections)")
+
+        for det in dets:
             class_name = det["class_name"]
             by_class[class_name] = by_class.get(class_name, 0) + 1
 
@@ -786,9 +799,13 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
                 "source_video_filename": original_filename,
             }
 
+            t0 = time.time()
             ok, buf = cv2.imencode(".jpg", det["cropped_image"])
+            print(f"[TIMING] image_encode frame={frame_num}: {time.time() - t0:.2f}s")
+
             upload_id = None
             if ok:
+                t0 = time.time()
                 upload_id = save_upload(
                     user_id=user_id,
                     file_bytes=buf.tobytes(),
@@ -796,7 +813,9 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
                     file_type="image",
                     model_context="garment_extraction",
                 )
+                print(f"[TIMING] save_upload_total frame={frame_num}: {time.time() - t0:.2f}s")
 
+            t0 = time.time()
             save_prediction(
                 user_id=user_id,
                 upload_id=upload_id,
@@ -804,8 +823,11 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
                 result_json=result_json,
                 confidence=det["confidence"],
             )
+            print(f"[TIMING] save_prediction frame={frame_num}: {time.time() - t0:.2f}s")
 
             detections_out.append(result_json)
+
+    print(f"[TIMING] TOTAL _process_video: {time.time() - request_start:.2f}s")
 
     return {
         "frames_processed": total_sampled,
