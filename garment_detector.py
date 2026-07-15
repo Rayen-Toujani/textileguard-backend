@@ -52,7 +52,7 @@ class GarmentDetector:
         self.class_names: dict[int, str] = self.model.names
 
     def detect_and_crop(
-        self, image: np.ndarray, conf_threshold: float = 0.5, imgsz: int = 384
+        self, image: np.ndarray, conf_threshold: float = 0.5, imgsz: int = 640
     ) -> list[dict[str, Any]]:
         """
         Run garment detection on a single image and crop each detected region.
@@ -63,12 +63,16 @@ class GarmentDetector:
                 preserved as-is into the crop.
             conf_threshold: minimum detection confidence to keep a result.
             imgsz: side length (px) ultralytics resizes the image to before
-                inference. Lower uses less memory/CPU per call at some cost
-                to small-object recall; 384 (down from ultralytics' default
-                640) was chosen to fit CPU-only inference in Render's
-                512MB memory ceiling -- see backend deploy notes. bbox/crop
-                coordinates are always returned in the original image's
-                pixel space regardless of imgsz.
+                inference. Was temporarily dropped to 384 to try to fit a
+                production OOM -- reverted to ultralytics' default 640 once
+                the real root cause turned out to be baseline/idle memory
+                (four models resident at startup), not per-inference size;
+                384 measurably hurt recall (0.956 -> 0.376 confidence on a
+                reference test image, enough to fall below this endpoint's
+                default conf_threshold=0.5 and silently miss the detection)
+                for no benefit on the actual problem. bbox/crop coordinates
+                are always returned in the original image's pixel space
+                regardless of imgsz.
 
         Returns:
             A list of dicts, one per detection above conf_threshold:
