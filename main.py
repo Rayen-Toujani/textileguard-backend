@@ -25,7 +25,18 @@ from auth import get_current_user_optional, verify_supabase_token, CurrentUser
 from training_data import save_upload_and_prediction, save_upload, save_prediction
 
 _root_cause_model: "RootCauseClassifier | None" = None
+
+# Garment detector is lazy-loaded (see get_garment_detector) rather than
+# loaded at startup like the other three models -- see load_models() below
+# for why. _garment_detector_lock guards the load-if-none-cached check:
+# the load itself runs via asyncio.to_thread so it doesn't block the event
+# loop for unrelated concurrent requests, which means there's an await
+# point between the None-check and the assignment -- without the lock, two
+# requests arriving before the first load finishes would both see None and
+# each load their own instance (wasteful, and briefly doubles memory right
+# when we're trying to avoid exactly that).
 _garment_detector: "GarmentDetector | None" = None
+_garment_detector_lock = asyncio.Lock()
 
 # Render's request/memory budget is limited — cap uploads so a single
 # request can't hang the service or exhaust its memory on a long/huge video.
@@ -90,20 +101,37 @@ async def load_models():
         except Exception as e:
             print(f"⚠ Root cause model load failed: {e}")
 
-    def _load_garment_detector():
-        global _garment_detector
-        try:
-            _garment_detector = GarmentDetector()
-            print("✓ Garment detector loaded on startup")
-        except FileNotFoundError as e:
-            print(f"⚠ Garment detector model not found (Part 3 disabled): {e}")
-        except Exception as e:
-            print(f"⚠ Garment detector load failed: {e}")
+    # Garment detector is deliberately NOT loaded here (unlike the other
+    # three models) -- see get_garment_detector() below. Loading all four
+    # models at startup pushed idle memory over Render's 512MB ceiling in
+    # production; the garment detector is now lazy-loaded on first use.
 
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _load_stain)
     loop.run_in_executor(None, _load_root_cause)
-    loop.run_in_executor(None, _load_garment_detector)
+
+
+async def get_garment_detector() -> GarmentDetector:
+    """
+    Lazy-loaded singleton for the garment detector -- returns the cached
+    instance if already loaded, otherwise loads it once and caches it for
+    the lifetime of the process (same end state as the other three models,
+    just deferred until first use instead of paid at startup).
+
+    Raises whatever GarmentDetector(...) raises (e.g. FileNotFoundError if
+    weights are missing) -- callers should catch and translate to an HTTP
+    error rather than let it surface as a raw 500.
+    """
+    global _garment_detector
+    if _garment_detector is not None:
+        return _garment_detector
+
+    async with _garment_detector_lock:
+        if _garment_detector is None:  # re-check: another request may have loaded it while we awaited the lock
+            _garment_detector = await asyncio.to_thread(GarmentDetector)
+
+    return _garment_detector
+
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     """Draw circles around detected defects"""
@@ -752,12 +780,16 @@ def _evenly_spaced_indices(n: int, k: int) -> list[int]:
     return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
 
 
-def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Optional[str]) -> dict:
+def _process_video(
+    tmp_path: str, user_id: Optional[str], original_filename: Optional[str], detector: GarmentDetector
+) -> dict:
     """
     Blocking: sample+de-dup frames, detect garments per frame, and save one
     uploads/predictions row per detected garment (not per frame). Call via
     asyncio.to_thread — cv2 decoding, model inference, and the Supabase
-    writes below are all synchronous.
+    writes below are all synchronous. `detector` is passed in (already
+    resolved via get_garment_detector()) rather than read off the module
+    global, since loading it is now lazy and async.
 
     TEMPORARY: per-stage [TIMING] logging below, added to diagnose a
     production timeout on this endpoint (grep Render logs for "[TIMING]").
@@ -783,7 +815,7 @@ def _process_video(tmp_path: str, user_id: Optional[str], original_filename: Opt
 
     for frame_num, (frame, frame_index, timestamp_seconds) in enumerate(frames_to_process):
         t0 = time.time()
-        dets = _garment_detector.detect_and_crop(frame)
+        dets = detector.detect_and_crop(frame)
         print(f"[TIMING] garment_inference frame={frame_num}: {time.time() - t0:.2f}s ({len(dets)} detections)")
 
         for det in dets:
@@ -864,6 +896,13 @@ async def analyze_video(
     Frames are streamed off disk one at a time by extract_distinct_frames —
     the whole video is never held in memory.
 
+    The garment detector itself is lazy-loaded (get_garment_detector) —
+    unlike the other three models, it is NOT loaded at startup, since all
+    four resident at once pushed idle memory over Render's 512MB ceiling.
+    The first call after a cold start pays the model-load cost on top of
+    inference; every call after that reuses the cached instance for the
+    lifetime of the process.
+
     Response: {
         "frames_processed": int,            # raw frames sampled at the interval, before de-dup
         "distinct_frames_kept": int,        # frames remaining after de-dup
@@ -874,8 +913,12 @@ async def analyze_video(
         "detections": [...]                 # one entry per detected garment
     }
     """
-    if _garment_detector is None:
-        raise HTTPException(status_code=503, detail="Garment detector not loaded")
+    t0 = time.time()
+    try:
+        detector = await get_garment_detector()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Garment detector unavailable: {e}")
+    print(f"[TIMING] garment_detector_load_or_cached: {time.time() - t0:.2f}s")
 
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     tmp_path = None
@@ -900,7 +943,7 @@ async def analyze_video(
             )
 
         user_id = current_user.id if current_user else None
-        return await asyncio.to_thread(_process_video, tmp_path, user_id, file.filename)
+        return await asyncio.to_thread(_process_video, tmp_path, user_id, file.filename, detector)
 
     except HTTPException:
         raise
