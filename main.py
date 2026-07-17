@@ -4,11 +4,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from PIL import Image, ImageDraw
 import asyncio
-import cv2
 import io
 import os
 import base64
-import tempfile
 from typing import List, Optional
 import pandas as pd
 from datetime import datetime
@@ -18,39 +16,10 @@ from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 from root_cause_classifier import RootCauseClassifier
 from report_enrichment import enrich_report_for_root_cause
-from garment_detector import GarmentDetector
-from video_frames import extract_distinct_frames
 from auth import get_current_user_optional, verify_supabase_token, CurrentUser
 from training_data import save_upload_and_prediction, save_upload, save_prediction
 
 _root_cause_model: "RootCauseClassifier | None" = None
-
-# Garment detector is lazy-loaded (see get_garment_detector) rather than
-# loaded at startup like the other three models -- see load_models() below
-# for why. _garment_detector_lock guards the load-if-none-cached check:
-# the load itself runs via asyncio.to_thread so it doesn't block the event
-# loop for unrelated concurrent requests, which means there's an await
-# point between the None-check and the assignment -- without the lock, two
-# requests arriving before the first load finishes would both see None and
-# each load their own instance (wasteful, and briefly doubles memory right
-# when we're trying to avoid exactly that).
-_garment_detector: "GarmentDetector | None" = None
-_garment_detector_lock = asyncio.Lock()
-
-# Render's request/memory budget is limited — cap uploads so a single
-# request can't hang the service or exhaust its memory on a long/huge video.
-MAX_VIDEO_BYTES = 50 * 1024 * 1024  # 50MB
-MAX_VIDEO_DURATION_SECONDS = 60
-
-# CPU-only garment-detector inference is the dominant per-request cost
-# (confirmed in production: a single frame's inference took long enough to
-# blow past Render's platform timeout). These bound the per-request workload
-# independently of video length: a wider sampling interval means fewer raw
-# frames to even consider, and the hard cap below is a last-resort backstop
-# in case dedup still leaves more distinct frames than is safe to run
-# detection on in one request.
-VIDEO_SAMPLE_INTERVAL_SECONDS = 2.5
-MAX_FRAMES_TO_PROCESS = 10
 
 
 class DefectRecord(BaseModel):
@@ -100,37 +69,9 @@ async def load_models():
         except Exception as e:
             print(f"⚠ Root cause model load failed: {e}")
 
-    # Garment detector is deliberately NOT loaded here (unlike the other
-    # three models) -- see get_garment_detector() below. Loading all four
-    # models at startup pushed idle memory over Render's 512MB ceiling in
-    # production; the garment detector is now lazy-loaded on first use.
-
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _load_stain)
     loop.run_in_executor(None, _load_root_cause)
-
-
-async def get_garment_detector() -> GarmentDetector:
-    """
-    Lazy-loaded singleton for the garment detector -- returns the cached
-    instance if already loaded, otherwise loads it once and caches it for
-    the lifetime of the process (same end state as the other three models,
-    just deferred until first use instead of paid at startup).
-
-    Raises whatever GarmentDetector(...) raises (e.g. FileNotFoundError if
-    weights are missing) -- callers should catch and translate to an HTTP
-    error rather than let it surface as a raw 500.
-    """
-    global _garment_detector
-    if _garment_detector is not None:
-        return _garment_detector
-
-    async with _garment_detector_lock:
-        if _garment_detector is None:  # re-check: another request may have loaded it while we awaited the lock
-            _garment_detector = await asyncio.to_thread(GarmentDetector)
-
-    return _garment_detector
-
 
 def draw_defects_on_image(image: Image.Image, predictions: list) -> Image.Image:
     """Draw circles around detected defects"""
@@ -751,203 +692,6 @@ async def predict_cause_batch(
         "results": results,
         "summary": {"total": len(results), "cause_counts": counts},
     }
-
-
-def _video_duration_seconds(path: str) -> Optional[float]:
-    """Best-effort video duration from container metadata; None if unavailable/unreliable."""
-    cap = cv2.VideoCapture(path)
-    try:
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        if fps and fps > 0 and frame_count and frame_count > 0:
-            return frame_count / fps
-        return None
-    finally:
-        cap.release()
-
-
-def _evenly_spaced_indices(n: int, k: int) -> list[int]:
-    """
-    Pick up to k indices spread evenly across range(n), preserving order.
-    Used to cap frame processing while keeping coverage of the whole video
-    rather than just its first k seconds.
-    """
-    if k >= n:
-        return list(range(n))
-    if k <= 1:
-        return [0]
-    return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
-
-
-def _process_video(
-    tmp_path: str, user_id: Optional[str], original_filename: Optional[str], detector: GarmentDetector
-) -> dict:
-    """
-    Blocking: sample+de-dup frames, detect garments per frame, and save one
-    uploads/predictions row per detected garment (not per frame). Call via
-    asyncio.to_thread — cv2 decoding, model inference, and the Supabase
-    writes below are all synchronous. `detector` is passed in (already
-    resolved via get_garment_detector()) rather than read off the module
-    global, since loading it is lazy and async.
-    """
-    kept_frames, total_sampled = extract_distinct_frames(
-        tmp_path, interval_seconds=VIDEO_SAMPLE_INTERVAL_SECONDS, similarity_threshold=0.95
-    )
-
-    frame_cap_applied = len(kept_frames) > MAX_FRAMES_TO_PROCESS
-    if frame_cap_applied:
-        indices = _evenly_spaced_indices(len(kept_frames), MAX_FRAMES_TO_PROCESS)
-        frames_to_process = [kept_frames[i] for i in indices]
-    else:
-        frames_to_process = kept_frames
-
-    by_class: dict[str, int] = {}
-    detections_out = []
-
-    for frame, frame_index, timestamp_seconds in frames_to_process:
-        dets = detector.detect_and_crop(frame)
-
-        for det in dets:
-            class_name = det["class_name"]
-            by_class[class_name] = by_class.get(class_name, 0) + 1
-
-            result_json = {
-                "class_name": class_name,
-                "confidence": det["confidence"],
-                "bbox": list(det["bbox"]),
-                "frame_index": frame_index,
-                "timestamp_seconds": round(timestamp_seconds, 2),
-                "source_video_filename": original_filename,
-            }
-
-            ok, buf = cv2.imencode(".jpg", det["cropped_image"])
-            upload_id = None
-            if ok:
-                upload_id = save_upload(
-                    user_id=user_id,
-                    file_bytes=buf.tobytes(),
-                    original_filename=f"garment_{class_name}_t{timestamp_seconds:.1f}s.jpg",
-                    file_type="image",
-                    model_context="garment_extraction",
-                )
-
-            save_prediction(
-                user_id=user_id,
-                upload_id=upload_id,
-                model_used="garment_detector",
-                result_json=result_json,
-                confidence=det["confidence"],
-            )
-
-            detections_out.append(result_json)
-
-    return {
-        "frames_processed": total_sampled,
-        "distinct_frames_kept": len(kept_frames),
-        "detection_frames_processed": len(frames_to_process),
-        "frame_cap_applied": frame_cap_applied,
-        "garments_detected": len(detections_out),
-        "by_class": by_class,
-        "detections": detections_out,
-    }
-
-
-@app.post("/api/analyze-video")
-async def analyze_video(
-    file: UploadFile = File(...),
-    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
-):
-    """
-    Part 3: detect and crop garments from a short video.
-
-    Samples frames from the uploaded video at a fixed
-    VIDEO_SAMPLE_INTERVAL_SECONDS interval, drops near-duplicate consecutive
-    frames (see video_frames.py), runs garment detection on each surviving
-    frame (up to MAX_FRAMES_TO_PROCESS of them — see _process_video), and
-    saves the CROPPED garment image (not the full frame) for each individual
-    detection — a frame with 2 garments produces 2 uploads/predictions rows.
-
-    The upload is capped at MAX_VIDEO_BYTES and MAX_VIDEO_DURATION_SECONDS,
-    and per-request inference work is separately capped at
-    MAX_FRAMES_TO_PROCESS regardless of how many distinct frames dedup
-    leaves — CPU-only garment-detector inference is the dominant per-request
-    cost, and Render has a limited request-time budget (confirmed in
-    production: a single frame's inference was slow enough to exceed it).
-    Frames are streamed off disk one at a time by extract_distinct_frames —
-    the whole video is never held in memory.
-
-    The garment detector itself is lazy-loaded (get_garment_detector) —
-    unlike the other three models, it is NOT loaded at startup, since all
-    four resident at once can exceed the memory ceiling on constrained
-    hosting (e.g. Render's free tier). The first call after a cold start
-    pays the model-load cost on top of inference; every call after that
-    reuses the cached instance for the lifetime of the process.
-
-    Known limitation: on memory-constrained deployments, loading a fourth
-    model alongside the other three can still fail. If get_garment_detector
-    raises for any reason, this returns a 503 with an honest, generic
-    message rather than surfacing a raw platform-level error — the real
-    exception is logged server-side for debugging. This feature is fully
-    functional in local/development environments without that constraint.
-
-    Response: {
-        "frames_processed": int,            # raw frames sampled at the interval, before de-dup
-        "distinct_frames_kept": int,        # frames remaining after de-dup
-        "detection_frames_processed": int,  # of those, how many were actually run through the detector
-        "frame_cap_applied": bool,          # true if distinct_frames_kept > MAX_FRAMES_TO_PROCESS
-        "garments_detected": int,
-        "by_class": {class_name: count, ...},
-        "detections": [...]                 # one entry per detected garment
-    }
-    """
-    try:
-        detector = await get_garment_detector()
-    except Exception as e:
-        print(f"Garment detector unavailable: {e}")
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Garment extraction is temporarily unavailable in this environment "
-                "due to resource constraints. This feature is fully functional in "
-                "local/development deployments."
-            ),
-        )
-
-    suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp_path = tmp.name
-            total_bytes = 0
-            while chunk := await file.read(1024 * 1024):
-                total_bytes += len(chunk)
-                if total_bytes > MAX_VIDEO_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Video exceeds the {MAX_VIDEO_BYTES // (1024 * 1024)}MB upload limit",
-                    )
-                tmp.write(chunk)
-
-        duration = await asyncio.to_thread(_video_duration_seconds, tmp_path)
-        if duration is not None and duration > MAX_VIDEO_DURATION_SECONDS:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Video exceeds the {MAX_VIDEO_DURATION_SECONDS}s duration limit ({duration:.1f}s)",
-            )
-
-        user_id = current_user.id if current_user else None
-        return await asyncio.to_thread(_process_video, tmp_path, user_id, file.filename, detector)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        print(f"Error in analyze_video: {str(e)}")
-        print(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
 
 if __name__ == "__main__":
