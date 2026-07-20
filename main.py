@@ -779,6 +779,25 @@ def _evenly_spaced_indices(n: int, k: int) -> list[int]:
     return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
 
 
+CROP_RESPONSE_MAX_DIM = 800  # cap crop_image_base64's largest side; keeps the JSON response size sane
+
+
+def _crop_to_base64(cropped_image) -> Optional[str]:
+    """
+    JPEG-encode a garment crop for inclusion in the API response, downscaling
+    first if needed so a response with several detections doesn't balloon.
+    Independent of the full-resolution encode used for Storage (see
+    _process_video) -- this one is response-only and never persisted.
+    """
+    h, w = cropped_image.shape[:2]
+    if max(h, w) > CROP_RESPONSE_MAX_DIM:
+        scale = CROP_RESPONSE_MAX_DIM / max(h, w)
+        cropped_image = cv2.resize(cropped_image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+
+    ok, buf = cv2.imencode(".jpg", cropped_image)
+    return base64.b64encode(buf.tobytes()).decode("ascii") if ok else None
+
+
 def _process_video(
     tmp_path: str, user_id: Optional[str], original_filename: Optional[str], detector: GarmentDetector
 ) -> dict:
@@ -839,7 +858,11 @@ def _process_video(
                 confidence=det["confidence"],
             )
 
-            detections_out.append(result_json)
+            # API response gets the crop image too, so the frontend can send it
+            # straight to /api/analyze-batch without a re-download -- kept out of
+            # result_json above so the DB row (already backed by the Storage
+            # upload via upload_id) doesn't carry a duplicate embedded image.
+            detections_out.append({**result_json, "crop_image_base64": _crop_to_base64(det["cropped_image"])})
 
     return {
         "frames_processed": total_sampled,
@@ -897,7 +920,15 @@ async def analyze_video(
         "frame_cap_applied": bool,          # true if distinct_frames_kept > MAX_FRAMES_TO_PROCESS
         "garments_detected": int,
         "by_class": {class_name: count, ...},
-        "detections": [...]                 # one entry per detected garment
+        "detections": [                     # one entry per detected garment
+            {
+                "class_name": str, "confidence": float, "bbox": [x1, y1, x2, y2],
+                "frame_index": int, "timestamp_seconds": float, "source_video_filename": str | None,
+                "crop_image_base64": str | None,  # JPEG, base64, downscaled to CROP_RESPONSE_MAX_DIM --
+                                                   # response-only, not what's persisted to Storage/DB
+            },
+            ...
+        ]
     }
     """
     try:
