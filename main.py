@@ -710,7 +710,7 @@ def _summarize_prediction(model_used: str, result_json: dict) -> str:
             return f"{top['class']} ({top['confidence'] * 100:.1f}%)"
 
         if model_used == "stain":
-            label = result_json.get("label", "unknown")
+            label = result_json.get("label", "unknown").replace("_", " ")
             confidence = result_json.get("confidence")
             return f"{label} ({confidence * 100:.1f}%)" if confidence is not None else label
 
