@@ -16,8 +16,9 @@ from preprocessing import preprocess_single_patch
 from stain_classifier import classify_stain, classify_stain_batch, get_stain_model
 from root_cause_classifier import RootCauseClassifier
 from report_enrichment import enrich_report_for_root_cause
-from auth import get_current_user_optional, verify_supabase_token, CurrentUser
+from auth import get_current_user_optional, get_current_user, verify_supabase_token, CurrentUser
 from training_data import save_upload_and_prediction, save_upload, save_prediction
+from supabase_client import get_supabase
 
 _root_cause_model: "RootCauseClassifier | None" = None
 
@@ -692,6 +693,115 @@ async def predict_cause_batch(
         "results": results,
         "summary": {"total": len(results), "cause_counts": counts},
     }
+
+
+def _summarize_prediction(model_used: str, result_json: dict) -> str:
+    """
+    Condense a predictions row's result_json into one human-readable line
+    for the history dropdown. Shape differs per model_used, so there's no
+    single field to just pass through.
+    """
+    try:
+        if model_used == "yolo":
+            preds = result_json.get("predictions") or []
+            if not preds:
+                return "No defects detected"
+            top = preds[0]
+            return f"{top['class']} ({top['confidence'] * 100:.1f}%)"
+
+        if model_used == "stain":
+            label = result_json.get("label", "unknown")
+            confidence = result_json.get("confidence")
+            return f"{label} ({confidence * 100:.1f}%)" if confidence is not None else label
+
+        if model_used == "root_cause":
+            cause = result_json.get("predicted_cause", "unknown").replace("_", " ")
+            confidence = result_json.get("confidence")
+            return f"{cause} ({confidence * 100:.1f}%)" if confidence is not None else cause
+
+        if model_used == "garment_detector":
+            class_name = result_json.get("class_name", "unknown")
+            confidence = result_json.get("confidence")
+            return f"{class_name} ({confidence * 100:.1f}%)" if confidence is not None else class_name
+
+    except (KeyError, TypeError, IndexError):
+        pass
+
+    return "Prediction recorded"
+
+
+@app.get("/api/history")
+async def get_history(
+    limit: int = 20,
+    offset: int = 0,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    The logged-in user's own prediction history across all four models
+    (yolo, stain, root_cause, garment_detector), most recent first.
+
+    Requires auth — this is inherently a "my own history" endpoint, so
+    unlike the prediction endpoints (which stay public and merely attach
+    a user_id when one happens to be logged in), there's no anonymous case
+    to support here.
+
+    Query params:
+        limit:  page size (default 20)
+        offset: rows to skip (default 0)
+
+    Response:
+        {
+            "entries": [
+                {
+                    "id": str,
+                    "model_used": "yolo" | "stain" | "root_cause" | "garment_detector",
+                    "summary": str,
+                    "confidence": float | None,
+                    "created_at": str,               # ISO 8601
+                    "storage_path": str | None,       # for a future thumbnail
+                    "original_filename": str | None,
+                },
+                ...
+            ],
+            "total": int,
+        }
+    """
+    client = get_supabase()
+
+    count_res = (
+        client.table("predictions")
+        .select("id", count="exact")
+        .eq("user_id", current_user.id)
+        .execute()
+    )
+    total = count_res.count or 0
+
+    res = (
+        client.table("predictions")
+        .select(
+            "id, model_used, result_json, confidence, created_at, "
+            "uploads(storage_path, original_filename)"
+        )
+        .eq("user_id", current_user.id)
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+
+    entries = [
+        {
+            "id": row["id"],
+            "model_used": row["model_used"],
+            "summary": _summarize_prediction(row["model_used"], row["result_json"] or {}),
+            "confidence": row["confidence"],
+            "created_at": row["created_at"],
+            "storage_path": (row.get("uploads") or {}).get("storage_path"),
+            "original_filename": (row.get("uploads") or {}).get("original_filename"),
+        }
+        for row in res.data
+    ]
+
+    return {"entries": entries, "total": total}
 
 
 if __name__ == "__main__":
